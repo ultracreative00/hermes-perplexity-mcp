@@ -82,6 +82,21 @@ async def broadcast(t: str, d: dict):
         await q.put(msg)
 
 # ---------------------------------------------------------------------------
+# Stale-page error detection
+# ---------------------------------------------------------------------------
+def _is_closed_error(e: Exception) -> bool:
+    """Return True if the exception indicates the browser page/context was closed."""
+    msg = str(e).lower()
+    return any(phrase in msg for phrase in [
+        "target page, context or browser has been closed",
+        "target closed",
+        "page has been closed",
+        "browser has been closed",
+        "context or browser has been closed",
+        "session closed",
+    ])
+
+# ---------------------------------------------------------------------------
 # Page health-check + auto-reconnect
 # ---------------------------------------------------------------------------
 async def _page_alive() -> bool:
@@ -628,6 +643,24 @@ async def _switch_model(model: str) -> dict:
     return r
 
 # ---------------------------------------------------------------------------
+# Core send logic — extracted so it can be retried after reconnect
+# ---------------------------------------------------------------------------
+
+async def _do_send(msg: str, attach: str, timeout: int) -> dict:
+    """Type, submit, and wait for a response. Assumes page is alive."""
+    baseline = await _snapshot_text()
+
+    # Navigate to home if we're not on perplexity
+    if "perplexity.ai" not in st.page.url:
+        log.info("[SEND] Not on perplexity.ai — navigating home first")
+        await st.page.goto("https://www.perplexity.ai", wait_until="load", timeout=30_000)
+        await asyncio.sleep(2)
+
+    await _type(msg)
+    await _submit()
+    await broadcast("tool_progress", {"status": "waiting for response"})
+    resp, attr = await _wait_resp(baseline=baseline, timeout=timeout)
+    return resp, attr
 
 async def tool_send_message(p: dict) -> dict:
     await _ensure()
@@ -638,28 +671,45 @@ async def tool_send_message(p: dict) -> dict:
     st.pending_attach = ""
     await broadcast("tool_start", {"tool": "send_message", "msg": msg[:80], "attach": attach})
     try:
-        # Snapshot current DOM text BEFORE submitting to detect stale responses
-        baseline = await _snapshot_text()
-        await _type(msg)
-        await _submit()
-        await broadcast("tool_progress", {"status": "waiting for response"})
-        resp, attr = await _wait_resp(baseline=baseline, timeout=p.get("timeout", 90))
-        st.last_resp = resp
-        st.last_attr = attr
-        mdl = st.detected_model or st.current_model
-        fname = f"response_{int(time.time())}.txt"
-        async with aiofiles.open(DOWNLOADS / fname, "w") as f:
-            await f.write(f"Model: {mdl}\nAttribution: {attr}\n{'\u2500'*60}\n{resp}")
-        await broadcast("response_ready", {
-            "preview": resp[:300],
-            "full": resp,
-            "model": mdl,
-            "file": fname,
-        })
-        return {"response": resp, "model": mdl, "attribution": attr, "saved_as": fname}
+        resp, attr = await _do_send(msg, attach, p.get("timeout", 90))
     except Exception as e:
-        await broadcast("tool_error", {"error": str(e)})
-        return {"error": str(e)}
+        if _is_closed_error(e):
+            # Page died mid-operation — reconnect once and retry
+            log.warning(f"[SEND] Stale page detected ({e}) — reconnecting and retrying...")
+            await broadcast("browser_reconnecting", {"note": "Page closed mid-send. Reconnecting and retrying..."})
+            # Reset state
+            for obj, method in [(st.ctx, "close"), (st.pw, "stop")]:
+                if obj is not None:
+                    try:
+                        await getattr(obj, method)()
+                    except Exception:
+                        pass
+            st.pw = st.ctx = st.page = None
+            st.ready = False
+            st.cdp_mode = False
+            await launch_browser()
+            try:
+                resp, attr = await _do_send(msg, attach, p.get("timeout", 90))
+            except Exception as retry_e:
+                await broadcast("tool_error", {"error": str(retry_e)})
+                return {"error": f"Retry after reconnect also failed: {retry_e}"}
+        else:
+            await broadcast("tool_error", {"error": str(e)})
+            return {"error": str(e)}
+
+    st.last_resp = resp
+    st.last_attr = attr
+    mdl = st.detected_model or st.current_model
+    fname = f"response_{int(time.time())}.txt"
+    async with aiofiles.open(DOWNLOADS / fname, "w") as f:
+        await f.write(f"Model: {mdl}\nAttribution: {attr}\n{'\u2500'*60}\n{resp}")
+    await broadcast("response_ready", {
+        "preview": resp[:300],
+        "full": resp,
+        "model": mdl,
+        "file": fname,
+    })
+    return {"response": resp, "model": mdl, "attribution": attr, "saved_as": fname}
 
 async def tool_switch_model(p: dict) -> dict:
     await _ensure()
@@ -786,14 +836,14 @@ async def lifespan(app: FastAPI):
         try: await st.pw.stop()
         except: pass
 
-app = FastAPI(title="Hermes-Perplexity MCP", version="9.7.0", lifespan=lifespan)
+app = FastAPI(title="Hermes-Perplexity MCP", version="9.8.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/sse")
 async def sse_ep(request: Request):
     q: asyncio.Queue = asyncio.Queue()
     clients.append(q)
-    await q.put(json.dumps({"type": "mcp_init", "version": "9.7.0", "tools": MCP_TOOL_DEFS, "models": MODELS}))
+    await q.put(json.dumps({"type": "mcp_init", "version": "9.8.0", "tools": MCP_TOOL_DEFS, "models": MODELS}))
     async def gen():
         try:
             while True:
@@ -818,7 +868,7 @@ async def mcp_ep(req: MCPReq):
         return {"jsonrpc": "2.0", "id": req.id, "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "hermes-perplexity", "version": "9.7.0"}}}
+            "serverInfo": {"name": "hermes-perplexity", "version": "9.8.0"}}}
     if req.method == "tools/list":
         return {"jsonrpc": "2.0", "id": req.id, "result": {"tools": MCP_TOOL_DEFS}}
     if req.method == "tools/call":
@@ -862,7 +912,7 @@ async def status_ep():
         "detected_model": st.detected_model, "sse_clients": len(clients),
         "chrome_exe": CHROME_EXE or "playwright bundled chromium",
         "debug_profile": str(DEBUG_PROFILE), "automation_profile": str(AUTO_PROFILE),
-        "last_response_length": len(st.last_resp), "version": "9.7.0",
+        "last_response_length": len(st.last_resp), "version": "9.8.0",
     }
 
 @app.get("/screenshot/latest")
