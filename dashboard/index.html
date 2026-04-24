@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hermes ↔ Perplexity MCP</title>
+<style>
+:root{--bg:#0f0f0f;--surface:#1a1a1a;--surface2:#242424;--border:#2e2e2e;
+--text:#e8e8e8;--muted:#888;--faint:#444;--primary:#4f98a3;--primary-h:#227f8b;
+--success:#6daa45;--error:#dd6974;--warn:#fdab43;
+--font:'Inter',system-ui,sans-serif;--radius:8px;--radius-lg:12px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font);background:var(--bg);color:var(--text);
+min-height:100vh;font-size:14px;line-height:1.5}
+.app{display:grid;grid-template-rows:56px 1fr;height:100vh;overflow:hidden}
+header{display:flex;align-items:center;gap:12px;padding:0 20px;
+background:var(--surface);border-bottom:1px solid var(--border)}
+header svg{color:var(--primary);flex-shrink:0}
+header h1{font-size:16px;font-weight:600;flex:1}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--faint);transition:.3s}
+.status-dot.ready{background:var(--success)}
+.status-dot.error{background:var(--error)}
+.status-label{font-size:12px;color:var(--muted)}
+main{display:grid;grid-template-columns:300px 1fr;overflow:hidden}
+.sidebar{background:var(--surface);border-right:1px solid var(--border);
+overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:16px}
+.section-title{font-size:11px;font-weight:600;color:var(--muted);
+text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}
+.card{background:var(--surface2);border:1px solid var(--border);
+border-radius:var(--radius);padding:12px}
+.model-select{width:100%;padding:8px 10px;background:var(--bg);
+border:1px solid var(--border);border-radius:var(--radius);
+color:var(--text);font-size:13px;cursor:pointer}
+.model-select:focus{outline:2px solid var(--primary);outline-offset:2px}
+.btn{display:flex;align-items:center;justify-content:center;gap:6px;
+padding:8px 14px;border-radius:var(--radius);font-size:13px;
+font-weight:500;cursor:pointer;border:none;transition:.18s;width:100%}
+.btn-primary{background:var(--primary);color:#fff}
+.btn-primary:hover{background:var(--primary-h)}
+.btn-secondary{background:var(--surface);border:1px solid var(--border);color:var(--text)}
+.btn-secondary:hover{background:var(--surface2)}
+.upload-area{border:2px dashed var(--border);border-radius:var(--radius);
+padding:20px;text-align:center;cursor:pointer;transition:.18s;color:var(--muted)}
+.upload-area:hover{border-color:var(--primary);color:var(--primary)}
+.file-list{display:flex;flex-direction:column;gap:4px;max-height:160px;overflow-y:auto}
+.file-item{display:flex;align-items:center;gap:8px;padding:6px 8px;
+background:var(--bg);border-radius:6px;font-size:12px}
+.file-item span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-item a{color:var(--primary);text-decoration:none;font-size:11px}
+.chat-area{display:flex;flex-direction:column;overflow:hidden}
+.messages{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:75%;padding:10px 14px;border-radius:var(--radius-lg);font-size:13px;line-height:1.6}
+.msg.user{background:var(--primary);color:#fff;align-self:flex-end;border-bottom-right-radius:4px}
+.msg.ai{background:var(--surface2);border:1px solid var(--border);align-self:flex-start;border-bottom-left-radius:4px}
+.msg.system{background:transparent;border:1px solid var(--border);
+color:var(--muted);align-self:center;font-size:12px;max-width:90%}
+.msg .model-tag{font-size:11px;opacity:.7;margin-top:4px}
+.input-row{padding:16px;border-top:1px solid var(--border);
+background:var(--surface);display:flex;gap:8px;align-items:flex-end}
+.input-row textarea{flex:1;padding:10px 14px;background:var(--bg);
+border:1px solid var(--border);border-radius:var(--radius-lg);
+color:var(--text);font-size:13px;resize:none;min-height:42px;max-height:120px;
+font-family:inherit;line-height:1.5}
+.input-row textarea:focus{outline:2px solid var(--primary);outline-offset:2px}
+.send-btn{padding:10px 18px;background:var(--primary);color:#fff;
+border:none;border-radius:var(--radius-lg);cursor:pointer;
+font-size:13px;font-weight:500;transition:.18s;white-space:nowrap}
+.send-btn:hover{background:var(--primary-h)}
+.send-btn:disabled{opacity:.5;cursor:not-allowed}
+.log-area{font-size:11px;color:var(--muted);background:var(--bg);
+padding:8px 12px;border-top:1px solid var(--border);max-height:90px;
+overflow-y:auto;font-family:monospace}
+input[type=file]{display:none}
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+<div class="app">
+  <header>
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+    </svg>
+    <h1>Hermes ↔ Perplexity MCP <span style="color:var(--muted);font-weight:400">v9</span></h1>
+    <div class="status-dot" id="dot"></div>
+    <span class="status-label" id="statusLabel">Connecting…</span>
+  </header>
+  <main>
+    <aside class="sidebar">
+      <div>
+        <div class="section-title">Model</div>
+        <div class="card" style="gap:8px;display:flex;flex-direction:column">
+          <select class="model-select" id="modelSel" onchange="switchModel(this.value)">
+            <option>Default</option>
+            <option>Claude Sonnet 4.5</option>
+            <option>GPT-4o</option>
+            <option>Gemini 2.0 Flash</option>
+            <option>Sonar Pro</option>
+            <option>Sonar</option>
+            <option>R1 1776</option>
+          </select>
+          <div style="font-size:11px;color:var(--muted)" id="modelStatus">—</div>
+        </div>
+      </div>
+      <div>
+        <div class="section-title">Upload File → Perplexity</div>
+        <div class="card" style="gap:8px;display:flex;flex-direction:column">
+          <div class="upload-area" onclick="document.getElementById('fu').click()">
+            Click to select file
+          </div>
+          <input type="file" id="fu" onchange="uploadFile(this)">
+          <div class="file-list" id="uploadList"></div>
+        </div>
+      </div>
+      <div>
+        <div class="section-title">Downloads from Perplexity</div>
+        <div class="card">
+          <div class="file-list" id="dlList"></div>
+          <button class="btn btn-secondary" style="margin-top:8px" onclick="refreshDL()">⟳ Refresh</button>
+        </div>
+      </div>
+      <div>
+        <div class="section-title">Actions</div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <button class="btn btn-secondary" onclick="newChat()">＋ New Chat</button>
+          <button class="btn btn-secondary" onclick="takeShot()">📷 Screenshot</button>
+          <button class="btn btn-secondary" onclick="checkLogin()">🔑 Check Login</button>
+        </div>
+      </div>
+    </aside>
+    <section class="chat-area">
+      <div class="messages" id="msgs">
+        <div class="msg system">Connect Hermes Agent via SSE at <code>http://localhost:3456/sse</code></div>
+      </div>
+      <div class="log-area" id="log">Waiting for events…</div>
+      <div class="input-row">
+        <textarea id="inp" rows="1" placeholder="Send message to Perplexity…"
+          onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea>
+        <button class="send-btn" id="sendBtn" onclick="send()">Send</button>
+      </div>
+    </section>
+  </main>
+</div>
+<script>
+const BASE='';
+let es,sending=false;
+function log(msg){const el=document.getElementById('log');el.textContent=new Date().toLocaleTimeString()+' '+msg;}
+function addMsg(role,text,model){
+  const c=document.getElementById('msgs');
+  const d=document.createElement('div');
+  d.className='msg '+role;
+  d.innerHTML=text.replace(/</g,'&lt;').replace(/\n/g,'<br>')+(model?`<div class="model-tag">Model: ${model}</div>`:'');
+  c.appendChild(d);c.scrollTop=c.scrollHeight;
+}
+function connectSSE(){
+  es=new EventSource(BASE+'/sse');
+  es.onmessage=e=>{try{handleEvent(JSON.parse(e.data));}catch{}};
+  es.onerror=()=>{document.getElementById('dot').className='status-dot error';
+    document.getElementById('statusLabel').textContent='Disconnected – retrying…';
+    setTimeout(connectSSE,3000);};
+}
+function handleEvent(d){
+  log(JSON.stringify(d).slice(0,120));
+  if(d.type==='browser_ready'){
+    document.getElementById('dot').className='status-dot ready';
+    document.getElementById('statusLabel').textContent=d.data.logged_in?'✓ Ready & Logged In':'⚠ Ready – Please Sign In';
+    addMsg('system',d.data.note||'Browser ready');
+  }else if(d.type==='browser_error'){
+    document.getElementById('dot').className='status-dot error';
+    addMsg('system','❌ '+d.data.error);
+  }else if(d.type==='response_ready'){
+    sending=false;document.getElementById('sendBtn').disabled=false;
+    addMsg('ai',d.data.preview+(d.data.preview.length>=300?'…':''),d.data.model);refreshDL();
+  }else if(d.type==='model_switched'){
+    document.getElementById('modelStatus').textContent=d.data.note;
+  }else if(d.type==='tool_start'){
+    addMsg('user',d.data.msg||'');
+  }else if(d.type==='screenshot_ready'){
+    addMsg('system','📷 Screenshot saved: '+d.data.file);refreshDL();
+  }else if(d.type==='new_chat'){
+    addMsg('system','✓ New chat started');
+  }else if(d.type==='file_uploaded'){
+    const li=document.getElementById('uploadList');
+    const it=document.createElement('div');it.className='file-item';
+    it.innerHTML=`<span>${d.data.original}</span><span style="color:var(--success)">✓</span>`;
+    li.prepend(it);
+  }
+}
+async function send(){
+  const inp=document.getElementById('inp'),msg=inp.value.trim();
+  if(!msg||sending)return;
+  sending=true;document.getElementById('sendBtn').disabled=true;inp.value='';
+  addMsg('user',msg);
+  const res=await fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'send_message',arguments:{message:msg}}})});
+  const j=await res.json();
+  if(j.error){sending=false;document.getElementById('sendBtn').disabled=false;addMsg('system','❌ '+j.error.message);}
+}
+async function switchModel(m){
+  document.getElementById('modelStatus').textContent='Switching…';
+  await fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'switch_model',arguments:{model:m}}})});
+}
+async function uploadFile(inp){
+  const f=inp.files[0];if(!f)return;
+  const fd=new FormData();fd.append('file',f);
+  const r=await fetch(BASE+'/upload',{method:'POST',body:fd});
+  const j=await r.json();
+  await fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({jsonrpc:'2.0',id:3,method:'tools/call',params:{name:'upload_file',arguments:{filename:j.filename}}})});
+}
+async function refreshDL(){
+  const r=await fetch(BASE+'/downloads');const j=await r.json();
+  document.getElementById('dlList').innerHTML=j.files.slice(0,10).map(f=>
+    `<div class="file-item"><span>${f.name}</span><a href="/download/${f.name}" download>↓</a></div>`).join('');
+}
+async function newChat(){
+  await fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({jsonrpc:'2.0',id:4,method:'tools/call',params:{name:'new_chat',arguments:{}}})});}
+async function takeShot(){
+  await fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({jsonrpc:'2.0',id:5,method:'tools/call',params:{name:'screenshot',arguments:{}}})});}
+async function checkLogin(){
+  const r=await fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({jsonrpc:'2.0',id:6,method:'tools/call',params:{name:'check_login',arguments:{}}})});
+  const j=await r.json();
+  try{const d=JSON.parse(j.result.content[0].text);
+    addMsg('system',`Login: ${d.logged_in?'✓ Logged in':'⚠ Not logged in'} | Profile: ${d.profile}`);}catch{}
+}
+connectSSE();refreshDL();
+</script>
+</body>
+</html>

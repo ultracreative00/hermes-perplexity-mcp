@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "perplexity-browser": {
+      "url": "http://localhost:3456/sse",
+      "transport": "sse",
+      "description": "Perplexity Browser MCP — no API key required"
+    }
+  }
+}

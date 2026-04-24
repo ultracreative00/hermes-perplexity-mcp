@@ -1,0 +1,495 @@
+import asyncio, json, logging, os, time, uuid, traceback
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
+
+import aiofiles
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
+from playwright.async_api import async_playwright, BrowserContext, Page
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("mcp")
+
+BASE_DIR     = Path(__file__).parent.parent
+UPLOADS      = BASE_DIR / "uploads"
+DOWNLOADS    = BASE_DIR / "downloads"
+AUTO_PROFILE = BASE_DIR / "chrome-profile"
+
+UPLOADS.mkdir(exist_ok=True)
+DOWNLOADS.mkdir(exist_ok=True)
+AUTO_PROFILE.mkdir(exist_ok=True)
+
+def find_chrome_exe() -> str:
+    for c in [
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/opt/google/chrome/google-chrome",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/snap/bin/chromium",
+        "/usr/bin/brave-browser",
+        "/usr/bin/microsoft-edge",
+    ]:
+        if Path(c).exists():
+            log.info(f"[CHROME] Found system Chrome: {c}")
+            return c
+    log.info("[CHROME] No system Chrome found — will use Playwright bundled Chromium")
+    return ""
+
+CHROME_EXE = find_chrome_exe()
+
+MODELS = [
+    "Default", "Claude Sonnet 4.5", "GPT-4o",
+    "Gemini 2.0 Flash", "Sonar Pro", "Sonar", "R1 1776",
+]
+MODEL_LABEL = {
+    "Default": None, "Claude Sonnet 4.5": "Claude", "GPT-4o": "GPT-4o",
+    "Gemini 2.0 Flash": "Gemini", "Sonar Pro": "Sonar Pro",
+    "Sonar": "Sonar", "R1 1776": "R1",
+}
+
+class State:
+    pw = None
+    ctx: BrowserContext | None = None
+    page: Page | None = None
+    current_model = "Default"
+    detected_model = ""
+    last_attr = ""
+    last_resp = ""
+    ready = False
+    logged_in = False
+
+st = State()
+clients: list[asyncio.Queue] = []
+
+async def broadcast(t: str, d: dict):
+    msg = json.dumps({"type": t, "data": d, "ts": time.time()})
+    for q in clients:
+        await q.put(msg)
+
+async def launch_browser():
+    try:
+        profile = str(AUTO_PROFILE)
+        log.info("=" * 55)
+        log.info(f"[LAUNCH] Profile  = {profile}")
+        log.info(f"[LAUNCH] Chrome   = {CHROME_EXE or 'playwright bundled chromium'}")
+        log.info(f"[LAUNCH] UID      = {os.getuid()}")
+        log.info("=" * 55)
+
+        for lock in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
+            lp = AUTO_PROFILE / lock
+            if lp.exists():
+                lp.unlink()
+                log.info(f"[LAUNCH] Removed stale lock: {lp.name}")
+
+        st.pw = await async_playwright().start()
+        args = [
+            "--password-store=basic",
+            "--use-mock-keychain",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-default-apps",
+            "--disable-infobars",
+            "--window-size=1280,900",
+        ]
+        if os.getuid() == 0:
+            args.append("--no-sandbox")
+
+        kw: dict = dict(
+            user_data_dir       = profile,
+            headless            = False,
+            viewport            = {"width": 1280, "height": 900},
+            args                = args,
+            ignore_default_args = ["--enable-automation"],
+            timeout             = 60_000,
+        )
+        if CHROME_EXE:
+            kw["executable_path"] = CHROME_EXE
+
+        st.ctx = await st.pw.chromium.launch_persistent_context(**kw)
+        await asyncio.sleep(1)
+        pages = st.ctx.pages
+        st.page = pages[0] if pages else await st.ctx.new_page()
+
+        nav_ok = False
+        for attempt in range(1, 4):
+            try:
+                await st.page.goto("https://www.perplexity.ai", wait_until="load", timeout=30_000)
+                nav_ok = True
+                break
+            except Exception as e:
+                log.warning(f"[LAUNCH] Nav attempt {attempt}/3 failed: {e}")
+                await asyncio.sleep(2)
+
+        await asyncio.sleep(3)
+        st.logged_in = await _check_login()
+        st.ready = True
+        log.info(f"[LAUNCH] READY — logged_in={st.logged_in}")
+
+        note = ("✓ Already logged in" if st.logged_in
+                else "⚠ First run: please sign into Perplexity in the browser — session will be saved to ./chrome-profile/")
+        await broadcast("browser_ready", {"logged_in": st.logged_in, "url": st.page.url, "profile": profile, "note": note})
+
+    except Exception as e:
+        log.error(f"[LAUNCH] FATAL: {e}")
+        log.error(traceback.format_exc())
+        await broadcast("browser_error", {"error": str(e), "traceback": traceback.format_exc()})
+
+async def _check_login() -> bool:
+    try:
+        for sel in ['a:has-text("Sign in")', 'button:has-text("Sign in")', 'a:has-text("Log in")', 'button:has-text("Log in")']:
+            el = st.page.locator(sel).first
+            if await el.count() > 0 and await el.is_visible():
+                return False
+        for sel in ['img[alt*="avatar" i]', 'button[aria-label*="account" i]', 'a[href*="/settings"]', 'div[class*="UserAvatar"]', 'img[src*="googleusercontent"]']:
+            if await st.page.locator(sel).first.count() > 0:
+                return True
+        return False
+    except Exception as e:
+        log.debug(f"[LOGIN] check error: {e}")
+        return False
+
+async def _ensure():
+    if not st.ready:
+        await launch_browser()
+
+async def _input():
+    for sel in ['[role="textbox"]', "textarea", 'div[contenteditable="true"]']:
+        el = st.page.locator(sel).first
+        if await el.count() > 0:
+            return el
+    return None
+
+async def _type(text: str):
+    el = await _input()
+    if not el:
+        raise RuntimeError("No chat input found on page")
+    await el.click()
+    await st.page.keyboard.press("Control+a")
+    await el.fill(text)
+
+async def _submit():
+    for sel in ['button[aria-label*="Submit" i]', 'button[type="submit"]', 'button[aria-label*="Ask" i]']:
+        b = st.page.locator(sel).first
+        if await b.count() > 0:
+            await b.click()
+            return
+    await st.page.keyboard.press("Enter")
+
+ATTR_PATTERNS = ["Prepared using", "Generated by", "Powered by", "Answer by", "Using model"]
+
+async def _extract() -> tuple[str, str]:
+    best = ""
+    for sel in ['[data-testid="answer-text"]', 'div[class*="prose"]', 'div[class*="answer"]',
+                'div[class*="markdown"]', '.markdown-content', "main p"]:
+        try:
+            els = st.page.locator(sel)
+            if await els.count() == 0:
+                continue
+            t = (await els.last.inner_text()).strip()
+            if len(t) > len(best):
+                best = t
+        except:
+            continue
+    attr = ""
+    try:
+        body = await st.page.evaluate("()=>document.body.innerText")
+        for line in body.splitlines():
+            ls = line.strip()
+            if any(p.lower() in ls.lower() for p in ATTR_PATTERNS) and len(ls) < 120:
+                attr = ls
+                break
+    except:
+        pass
+    if attr:
+        for m in MODELS:
+            if m.lower() in attr.lower():
+                st.detected_model = m
+                break
+    return best, attr
+
+async def _wait_resp(timeout: int = 90) -> tuple[str, str]:
+    await asyncio.sleep(2)
+    deadline = time.time() + timeout
+    prev = ""
+    stable = 0
+    while time.time() < deadline:
+        await asyncio.sleep(1.5)
+        sv = False
+        try:
+            sv = await st.page.locator('button[aria-label*="Stop" i],button:has-text("Stop")').first.is_visible()
+        except:
+            pass
+        text, attr = await _extract()
+        if text and text == prev:
+            stable += 1
+            if stable >= 3 or (not sv and stable >= 1):
+                return text, attr
+        else:
+            stable = 0
+            prev = text
+    return await _extract()
+
+async def _switch_model(model: str) -> dict:
+    r: dict = {"success": False, "model": model, "note": ""}
+    btn = None
+    for sel in ['button[aria-label*="model" i]', 'button:has-text("Default")', 'button:has-text("Claude")',
+                'button:has-text("GPT")', 'button:has-text("Gemini")', 'button:has-text("Sonar")',
+                'button:has-text("R1")', 'div[class*="toolbar"] button']:
+        try:
+            loc = st.page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible():
+                lbl = (await loc.get_attribute("aria-label") or "").lower()
+                if any(x in lbl for x in ["send", "submit", "attach", "upload"]):
+                    continue
+                btn = loc
+                break
+        except:
+            continue
+    if not btn:
+        await st.page.screenshot(path=str(DOWNLOADS / "debug_model.png"))
+        r["note"] = "Model btn not found — screenshot saved"
+        st.current_model = model
+        return r
+    await btn.click()
+    await asyncio.sleep(1)
+    pt = MODEL_LABEL.get(model)
+    if not pt:
+        await st.page.keyboard.press("Escape")
+        st.current_model = "Default"
+        r.update({"success": True, "note": "Default active"})
+        return r
+    for sel in [f'[role="option"]:has-text("{pt}")', f'li:has-text("{pt}")',
+                f'button:has-text("{pt}")', f'div[role="menuitem"]:has-text("{pt}")']: 
+        try:
+            opt = st.page.locator(sel).first
+            if await opt.count() > 0 and await opt.is_visible():
+                await opt.click()
+                await asyncio.sleep(0.8)
+                st.current_model = model
+                r.update({"success": True, "note": f"Selected {pt}"})
+                return r
+        except:
+            continue
+    await st.page.screenshot(path=str(DOWNLOADS / "debug_picker.png"))
+    await st.page.keyboard.press("Escape")
+    r["note"] = f"Option '{pt}' not found in picker"
+    st.current_model = model
+    return r
+
+async def tool_send_message(p: dict) -> dict:
+    await _ensure()
+    msg = p.get("message", "").strip()
+    if not msg:
+        return {"error": "message is required"}
+    await broadcast("tool_start", {"tool": "send_message", "msg": msg[:80]})
+    try:
+        await _type(msg)
+        await _submit()
+        await broadcast("tool_progress", {"status": "waiting for response"})
+        resp, attr = await _wait_resp(p.get("timeout", 90))
+        st.last_resp = resp
+        st.last_attr = attr
+        mdl = st.detected_model or st.current_model
+        fname = f"response_{int(time.time())}.txt"
+        async with aiofiles.open(DOWNLOADS / fname, "w") as f:
+            await f.write(f"Model: {mdl}\nAttribution: {attr}\n{'─'*60}\n{resp}")
+        await broadcast("response_ready", {"preview": resp[:300], "model": mdl, "file": fname})
+        return {"response": resp, "model": mdl, "attribution": attr, "saved_as": fname}
+    except Exception as e:
+        await broadcast("tool_error", {"error": str(e)})
+        return {"error": str(e)}
+
+async def tool_switch_model(p: dict) -> dict:
+    await _ensure()
+    m = p.get("model", "Default")
+    if m not in MODELS:
+        return {"error": f"Unknown model: {m}. Valid: {MODELS}"}
+    r = await _switch_model(m)
+    await broadcast("model_switched", r)
+    return r
+
+async def tool_upload_file(p: dict) -> dict:
+    await _ensure()
+    fn = p.get("filename", "")
+    fp = UPLOADS / fn
+    if not fp.exists():
+        return {"error": f"File not found in uploads/: {fn}"}
+    for sel in ['button[aria-label*="ttach" i]', 'input[type="file"]']:
+        loc = st.page.locator(sel).first
+        if await loc.count() == 0:
+            continue
+        tag = await loc.evaluate("el=>el.tagName.toLowerCase()")
+        if tag == "input":
+            await loc.set_input_files(str(fp))
+        else:
+            async with st.page.expect_file_chooser(timeout=5000) as fc:
+                await loc.click()
+            await (await fc.value).set_files(str(fp))
+        await broadcast("file_sent_to_browser", {"file": fn})
+        return {"success": True, "file": fn}
+    return {"error": "No file upload control found on page"}
+
+async def tool_get_last_response(p: dict) -> dict:
+    return {"response": st.last_resp, "attribution": st.last_attr, "model": st.detected_model or st.current_model}
+
+async def tool_screenshot(p: dict) -> dict:
+    await _ensure()
+    fn = f"screenshot_{int(time.time())}.png"
+    await st.page.screenshot(path=str(DOWNLOADS / fn), full_page=p.get("full_page", False))
+    await broadcast("screenshot_ready", {"file": fn})
+    return {"file": fn}
+
+async def tool_new_chat(p: dict) -> dict:
+    await _ensure()
+    await st.page.goto("https://www.perplexity.ai", wait_until="load")
+    await asyncio.sleep(2)
+    st.last_resp = st.last_attr = st.detected_model = ""
+    await broadcast("new_chat", {"status": "ok"})
+    return {"success": True}
+
+async def tool_list_models(p: dict) -> dict:
+    return {"models": MODELS, "current": st.current_model, "detected": st.detected_model}
+
+async def tool_check_login(p: dict) -> dict:
+    await _ensure()
+    li = await _check_login()
+    return {"logged_in": li, "profile": str(AUTO_PROFILE), "chrome": CHROME_EXE or "playwright bundled chromium"}
+
+TOOLS = {
+    "send_message":      tool_send_message,
+    "switch_model":      tool_switch_model,
+    "upload_file":       tool_upload_file,
+    "get_last_response": tool_get_last_response,
+    "screenshot":        tool_screenshot,
+    "new_chat":          tool_new_chat,
+    "list_models":       tool_list_models,
+    "check_login":       tool_check_login,
+}
+
+MCP_TOOL_DEFS = [
+    {"name": "send_message", "description": "Type a message into Perplexity and return the AI response",
+     "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}, "timeout": {"type": "integer", "default": 90}}, "required": ["message"]}},
+    {"name": "switch_model", "description": "Switch the active Perplexity model",
+     "inputSchema": {"type": "object", "properties": {"model": {"type": "string", "enum": MODELS}}, "required": ["model"]}},
+    {"name": "upload_file", "description": "Upload a file from uploads/ folder into the Perplexity chat",
+     "inputSchema": {"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"]}},
+    {"name": "get_last_response", "description": "Retrieve the last response received from Perplexity",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "screenshot", "description": "Take a screenshot of the current browser state",
+     "inputSchema": {"type": "object", "properties": {"full_page": {"type": "boolean", "default": False}}}},
+    {"name": "new_chat", "description": "Navigate to Perplexity home to start a fresh conversation",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "list_models", "description": "List all available Perplexity models and the currently active one",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "check_login", "description": "Check whether Perplexity is currently logged in",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(launch_browser())
+    def _done(t):
+        if not t.cancelled() and t.exception():
+            log.error(f"[LIFESPAN] Browser task crashed: {t.exception()}")
+    task.add_done_callback(_done)
+    yield
+    if not task.done(): task.cancel()
+    if st.ctx:
+        try: await st.ctx.close()
+        except: pass
+    if st.pw:
+        try: await st.pw.stop()
+        except: pass
+
+app = FastAPI(title="Hermes-Perplexity MCP", version="9.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.get("/sse")
+async def sse_ep(request: Request):
+    q: asyncio.Queue = asyncio.Queue()
+    clients.append(q)
+    await q.put(json.dumps({"type": "mcp_init", "version": "9.0.0", "tools": MCP_TOOL_DEFS, "models": MODELS}))
+    async def gen():
+        try:
+            while True:
+                if await request.is_disconnected(): break
+                try:
+                    yield {"data": await asyncio.wait_for(q.get(), timeout=25)}
+                except asyncio.TimeoutError:
+                    yield {"data": json.dumps({"type": "ping", "ts": time.time()})}
+        finally:
+            if q in clients: clients.remove(q)
+    return EventSourceResponse(gen())
+
+class MCPReq(BaseModel):
+    jsonrpc: str = "2.0"
+    id: Any = None
+    method: str
+    params: dict = {}
+
+@app.post("/mcp")
+async def mcp_ep(req: MCPReq):
+    if req.method == "initialize":
+        return {"jsonrpc": "2.0", "id": req.id, "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "hermes-perplexity", "version": "9.0.0"}}}
+    if req.method == "tools/list":
+        return {"jsonrpc": "2.0", "id": req.id, "result": {"tools": MCP_TOOL_DEFS}}
+    if req.method == "tools/call":
+        nm = req.params.get("name")
+        ag = req.params.get("arguments", {})
+        if nm not in TOOLS:
+            return {"jsonrpc": "2.0", "id": req.id, "error": {"code": -32601, "message": f"Unknown tool: {nm}"}}
+        r = await TOOLS[nm](ag)
+        return {"jsonrpc": "2.0", "id": req.id, "result": {"content": [{"type": "text", "text": json.dumps(r)}]}}
+    return {"jsonrpc": "2.0", "id": req.id, "error": {"code": -32601, "message": f"Unknown method: {req.method}"}}
+
+@app.post("/upload")
+async def up_ep(file: UploadFile = File(...)):
+    safe = f"{uuid.uuid4().hex}_{file.filename}"
+    content = await file.read()
+    async with aiofiles.open(UPLOADS / safe, "wb") as f:
+        await f.write(content)
+    await broadcast("file_uploaded", {"filename": safe, "original": file.filename, "size": len(content)})
+    return {"filename": safe, "original": file.filename, "size": len(content)}
+
+@app.get("/download/{filename}")
+async def dl_ep(filename: str):
+    p = DOWNLOADS / filename
+    if not p.exists(): raise HTTPException(404, "File not found")
+    return FileResponse(str(p), filename=filename)
+
+@app.get("/downloads")
+async def dls_ep():
+    files = sorted(
+        [{"name": f.name, "size": f.stat().st_size, "modified": f.stat().st_mtime}
+         for f in DOWNLOADS.iterdir() if f.is_file()],
+        key=lambda x: -x["modified"])
+    return {"files": files}
+
+@app.get("/status")
+async def status_ep():
+    return {"browser_ready": st.ready, "logged_in": st.logged_in, "current_model": st.current_model,
+            "detected_model": st.detected_model, "sse_clients": len(clients),
+            "chrome_exe": CHROME_EXE or "playwright bundled chromium",
+            "automation_profile": str(AUTO_PROFILE), "last_response_length": len(st.last_resp), "version": "9.0.0"}
+
+@app.get("/screenshot/latest")
+async def latest_shot():
+    shots = sorted(DOWNLOADS.glob("screenshot_*.png"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not shots: raise HTTPException(404, "No screenshots yet")
+    return FileResponse(str(shots[0]))
+
+DASHBOARD_DIR = BASE_DIR / "dashboard"
+app.mount("/dashboard", StaticFiles(directory=str(DASHBOARD_DIR), html=True), name="dashboard")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("mcp_server:app", host="0.0.0.0", port=3456, reload=False)
