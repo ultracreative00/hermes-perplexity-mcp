@@ -1,4 +1,4 @@
-# Hermes ↔ Perplexity MCP Bridge v9.9.1
+# Hermes ↔ Perplexity MCP Bridge v9.9.2
 
 > **Control Perplexity AI via your real browser — no API key required. No Perplexity API is used or permitted.**
 
@@ -26,7 +26,7 @@ Then open: **http://localhost:3456/dashboard/**
 ./start.sh
 ```
 
-`start.sh` now does the full startup sequence automatically:
+`start.sh` does the full startup sequence automatically:
 
 1. **Finds Chrome** on your system (`google-chrome-stable`, `chromium`, `brave-browser`, etc.)
 2. **Kills any existing Chrome** on port 9222 to avoid conflicts
@@ -107,7 +107,7 @@ GET http://localhost:3456/status  →  "mode": "CDP (real Chrome)" or "Playwrigh
 
 | Tool | Description |
 |---|---|
-| `send_message` | Send a message to Perplexity and get back **only the latest isolated response** (no stacking from previous answers). Memory context is auto-prepended if memories exist. |
+| `send_message` | Send a message to Perplexity and get back **only the latest isolated response** (no stacking from previous answers). Memory context is auto-prepended if memories exist. Auto-reconnects if Chrome was closed mid-session. |
 | `switch_model` | Change the active model |
 | `upload_file` | Upload a file into the active chat |
 | `get_last_response` | Retrieve the last response text |
@@ -199,7 +199,7 @@ python client/hermes_mcp_client.py --new-chat
 ```
 hermes-perplexity-mcp/
 ├── server/
-│   └── mcp_server.py        # FastAPI + Playwright MCP server (v9.9.1)
+│   └── mcp_server.py        # FastAPI + Playwright MCP server (v9.9.2)
 ├── client/
 │   └── hermes_mcp_client.py # CLI client for Hermes
 ├── dashboard/
@@ -218,6 +218,12 @@ hermes-perplexity-mcp/
 ---
 
 ## Changelog
+
+### v9.9.2
+- **Stale-page auto-reconnect**: Fixed `Locator.count: Target page, context or browser has been closed` error — the server now detects a dead Playwright `Page` object before every operation via `_page_alive()` health-check and automatically relaunches the browser if the page is gone
+- **`_is_closed_error()` guard**: Any mid-send `TargetClosedError` or session-closed exception triggers a full browser teardown → relaunch → retry cycle instead of a hard failure
+- **`_ensure_page_alive()`**: Called at the start of every tool handler so stale state never reaches Playwright locator calls
+- **Broadcast on reconnect**: Dashboard receives a `browser_reconnecting` event so users see live status during recovery
 
 ### v9.9.1
 - **`start.sh` auto-Chrome**: Kills old Chrome, launches fresh CDP instance, opens Perplexity automatically
@@ -242,6 +248,7 @@ hermes-perplexity-mcp/
 
 | Symptom | Fix |
 |---|---|
+| `Locator.count: Target page, context or browser has been closed` | Fixed in v9.9.2 — server auto-detects dead page and relaunches. Pull latest and restart. |
 | `❌ Perplexity isn't Logged In` on startup | Chrome opened Perplexity — sign in, then re-run `./start.sh` |
 | `Locator.click: Timeout` / sticky overlay error | Fixed in v9.9.1 — pull latest and restart |
 | `CDP connect failed` in logs | Chrome isn't running on port 9222 — server falls back to Playwright automatically |
