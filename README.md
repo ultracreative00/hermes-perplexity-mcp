@@ -1,8 +1,10 @@
-# Hermes ↔ Perplexity MCP Bridge v9.1
+# Hermes ↔ Perplexity MCP Bridge v9.9.1
 
 > **Control Perplexity AI via your real browser — no API key required. No Perplexity API is used or permitted.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+---
 
 ## Quick Start
 
@@ -12,33 +14,40 @@ cd hermes-perplexity-mcp
 bash install.sh
 ```
 
-`bash install.sh` handles everything — dependencies, permissions, virtual environment setup, and first-run checks. No need to run `setup.sh` or `start.sh` manually on first install.
+`bash install.sh` handles everything — dependencies, virtual environment, and first-run checks.
 
 Then open: **http://localhost:3456/dashboard/**
 
 ---
 
-## Recommended: Launch Real Chrome First (Avoids Bot Detection)
-
-Perplexity detects automated browsers and may block the login screen. To avoid this, launch your **real Chrome** with remote debugging enabled **before** starting the MCP server:
+## Starting the Server
 
 ```bash
-google-chrome-stable \
-  --remote-debugging-port=9222 \
-  --user-data-dir="$HOME/chrome-debug-profile"
+./start.sh
 ```
 
-Sign into Perplexity in that window (first time only — session is saved to `~/chrome-debug-profile`).
+`start.sh` now does the full startup sequence automatically:
 
-Then start the server in a second terminal:
+1. **Finds Chrome** on your system (`google-chrome-stable`, `chromium`, `brave-browser`, etc.)
+2. **Kills any existing Chrome** on port 9222 to avoid conflicts
+3. **Launches a fresh Chrome** with remote debugging enabled:
+   ```
+   --remote-debugging-port=9222
+   --user-data-dir=~/chrome-debug-profile
+   → opens https://www.perplexity.ai
+   ```
+4. **Checks login status** via Playwright CDP using the Perplexity nav element XPath
+5. **Blocks startup** if not logged in — prints a clear error and exits:
+   ```
+   ❌  Perplexity isn't Logged In
+   Please sign into Perplexity in the Chrome window that just opened, then re-run ./start.sh
+   ```
+6. **Starts the MCP server** only when Perplexity is confirmed logged in:
+   ```
+   ✅  Perplexity is logged in — ready to go!
+   ```
 
-```bash
-bash install.sh
-```
-
-The server will log `✓ Connected to real Chrome via CDP` and operate fully logged in.
-
-> **If you skip this step**, the server falls back to a Playwright-managed browser. It still works, but you may need to sign in manually on the first run.
+> **First run?** Chrome will open Perplexity. Sign in, then re-run `./start.sh`. Your session is saved to `~/chrome-debug-profile` — you won't need to sign in again.
 
 ---
 
@@ -52,30 +61,27 @@ Hermes Agent
     ▼
 MCP Server (FastAPI + Playwright)
     │
-    ├─ CDP mode (preferred): attaches to real Chrome on port 9222
-    │    google-chrome-stable --remote-debugging-port=9222
+    ├─ CDP mode (default): attaches to real Chrome launched by start.sh
+    │    --remote-debugging-port=9222
     │    --user-data-dir="$HOME/chrome-debug-profile"
     │
-    └─ Fallback mode: Playwright persistent context
+    └─ Fallback mode: Playwright persistent context (if no Chrome found)
          Dedicated profile: ./chrome-profile/
     │
     ▼
 Perplexity Browser (https://www.perplexity.ai)
 ```
 
-## How the CDP / Fallback Logic Works
-
-On every startup the server tries two strategies in order:
+### CDP vs Fallback
 
 | # | Mode | How | Login |
 |---|------|-----|-------|
 | 1 | **CDP (real Chrome)** | Connects to Chrome already running on `localhost:9222` | Uses your existing browser session — no re-login needed |
-| 2 | **Playwright fallback** | Launches its own Chromium with `./chrome-profile/` | Sign in once; session is saved for future runs |
+| 2 | **Playwright fallback** | Launches its own Chromium with `./chrome-profile/` | Sign in once; session saved for future runs |
 
-Check which mode is active at any time:
-
+Check active mode at any time:
 ```
-GET http://localhost:3456/status   →  "mode": "CDP (real Chrome)" or "Playwright (automation)"
+GET http://localhost:3456/status  →  "mode": "CDP (real Chrome)" or "Playwright (automation)"
 ```
 
 ---
@@ -88,22 +94,65 @@ GET http://localhost:3456/status   →  "mode": "CDP (real Chrome)" or "Playwrig
 | `http://localhost:3456/sse` | SSE stream for Hermes |
 | `http://localhost:3456/mcp` | JSON-RPC 2.0 tool calls |
 | `http://localhost:3456/status` | Server status JSON |
+| `http://localhost:3456/memory` | View all stored memories (GET) |
 | `http://localhost:3456/upload` | Upload file (POST multipart) |
-| `http://localhost:3456/download/<file>` | Download response file |
-| `http://localhost:3456/downloads` | List all downloads |
+| `http://localhost:3456/download/<file>` | Download a response file |
+| `http://localhost:3456/downloads` | List all downloaded files |
+
+---
 
 ## Available Tools
 
+### Core Tools
+
 | Tool | Description |
 |---|---|
-| `send_message` | Send message to Perplexity, get response |
-| `switch_model` | Change model (Default / Claude Sonnet 4.5 / GPT-4o / Gemini 2.0 Flash / Sonar Pro / Sonar / R1 1776) |
+| `send_message` | Send a message to Perplexity and get back **only the latest isolated response** (no stacking from previous answers). Memory context is auto-prepended if memories exist. |
+| `switch_model` | Change the active model |
 | `upload_file` | Upload a file into the active chat |
-| `get_last_response` | Retrieve last response text |
-| `screenshot` | Screenshot the browser |
-| `new_chat` | Start a fresh conversation |
-| `list_models` | List available models |
+| `get_last_response` | Retrieve the last response text |
+| `screenshot` | Take a screenshot of the browser |
+| `new_chat` | Navigate to Perplexity home to start a fresh conversation |
+| `list_models` | List all available models and the currently active one |
 | `check_login` | Verify login status and show connection mode |
+
+### Memory Tools
+
+Perplexity doesn't remember previous conversations. The memory system lets Hermes store facts persistently — they are automatically injected as context into every `send_message` call.
+
+| Tool | Description |
+|---|---|
+| `memory_set` | Store a key-value fact (e.g. `user_name = "Ahmad"`). Pass empty value to delete. |
+| `memory_get` | Retrieve a specific memory by key, or all memories if no key given. |
+| `memory_delete` | Delete a memory entry by key. |
+
+**How it works:**
+
+When any memories are stored, every `send_message` automatically prepends:
+```
+[Context from memory]
+- user_name: Ahmad
+- user_location: Islamabad, Pakistan
+- preferred_language: English
+
+<your actual message here>
+```
+
+Memories are persisted to `memory.json` in the project root and survive server restarts.
+
+### Available Models
+
+| Model | Label |
+|---|---|
+| `Default` | Perplexity default |
+| `Claude Sonnet 4.5` | claude |
+| `GPT-4o` | gpt |
+| `Gemini 2.0 Flash` | gemini |
+| `Sonar Pro` | sonar pro |
+| `Sonar` | sonar |
+| `R1 1776` | r1 |
+
+---
 
 ## Hermes Agent Config
 
@@ -119,6 +168,8 @@ Add `hermes_mcp_config.json` to your Hermes agent:
   }
 }
 ```
+
+---
 
 ## CLI Client
 
@@ -141,12 +192,14 @@ python client/hermes_mcp_client.py --upload ~/docs/paper.pdf --message "Summaris
 python client/hermes_mcp_client.py --new-chat
 ```
 
+---
+
 ## Project Structure
 
 ```
 hermes-perplexity-mcp/
 ├── server/
-│   └── mcp_server.py        # FastAPI + Playwright MCP server (v9.1)
+│   └── mcp_server.py        # FastAPI + Playwright MCP server (v9.9.1)
 ├── client/
 │   └── hermes_mcp_client.py # CLI client for Hermes
 ├── dashboard/
@@ -154,21 +207,50 @@ hermes-perplexity-mcp/
 ├── chrome-profile/          # Playwright fallback Chrome profile
 ├── uploads/                 # Files uploaded to Perplexity
 ├── downloads/               # Responses saved from Perplexity
+├── memory.json              # Persistent memory store (auto-created)
 ├── requirements.txt
 ├── install.sh               # One-command install & start
 ├── setup.sh
-├── start.sh
+├── start.sh                 # Full startup: Chrome → login check → MCP server
 └── hermes_mcp_config.json
 ```
+
+---
+
+## Changelog
+
+### v9.9.1
+- **`start.sh` auto-Chrome**: Kills old Chrome, launches fresh CDP instance, opens Perplexity automatically
+- **Login gate**: `start.sh` blocks server start if Perplexity isn't logged in — prints `❌ Perplexity isn't Logged In` and exits
+- **Sticky overlay click fix**: Fixed `Locator.click: Timeout` error caused by Perplexity's sticky header intercepting pointer events — now uses JS `focus()` + scroll offset instead of Playwright `.click()`
+
+### v9.9.0
+- **Isolated responses**: `send_message` now returns only the latest answer — no more stacking of previous answers in the reply
+- **Memory system**: New `memory_set`, `memory_get`, `memory_delete` tools with auto-injection into every message
+- **Persistent memory**: Memories saved to `memory.json` and survive server restarts
+- **`/memory` endpoint**: View all stored memories via REST
+
+### v9.x
+- Auto-reconnect when browser page closes mid-session
+- Stale-page detection and graceful recovery
+- Baseline snapshot diffing to detect new responses accurately
+- Source/citation extraction and formatting
+
+---
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| Perplexity opens but no login option visible | Launch real Chrome with `--remote-debugging-port=9222` first (see above) |
+| `❌ Perplexity isn't Logged In` on startup | Chrome opened Perplexity — sign in, then re-run `./start.sh` |
+| `Locator.click: Timeout` / sticky overlay error | Fixed in v9.9.1 — pull latest and restart |
 | `CDP connect failed` in logs | Chrome isn't running on port 9222 — server falls back to Playwright automatically |
-| `Permission denied` on `install.sh` | Run `bash install.sh` (not `./install.sh`) — no chmod needed |
+| Response includes previous answers (stacking) | Fixed in v9.9.0 — pull latest and restart |
+| `Permission denied` on `install.sh` | Run `bash install.sh` (not `./install.sh`) |
 | Already logged in but server says not logged in | Run `check_login` tool or check `/status` to confirm CDP mode is active |
+| Memory not being injected | Check `/memory` endpoint — if empty, use `memory_set` to store context first |
+
+---
 
 ## License
 
