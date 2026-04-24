@@ -76,6 +76,48 @@ async def broadcast(t: str, d: dict):
     for q in clients:
         await q.put(msg)
 
+# ---------------------------------------------------------------------------
+# Page health-check + auto-reconnect
+# ---------------------------------------------------------------------------
+async def _page_alive() -> bool:
+    """Return True if st.page is a live, usable Playwright Page."""
+    if st.page is None:
+        return False
+    try:
+        await st.page.evaluate("()=>1", timeout=3_000)
+        return True
+    except Exception:
+        return False
+
+async def _ensure_page_alive():
+    """
+    If the current page is dead (browser closed / tab crashed), tear down the
+    stale state and relaunch so the next tool call works cleanly.
+    """
+    if await _page_alive():
+        return
+
+    log.warning("[RECONNECT] Page is dead — relaunching browser...")
+    await broadcast("browser_reconnecting", {"note": "Browser page was closed. Reconnecting..."})
+
+    # Clean up stale objects without raising
+    for obj, method in [(st.ctx, "close"), (st.pw, "stop")]:
+        if obj is not None:
+            try:
+                await getattr(obj, method)()
+            except Exception:
+                pass
+
+    st.pw   = None
+    st.ctx  = None
+    st.page = None
+    st.ready = False
+    st.cdp_mode = False
+
+    await launch_browser()
+
+# ---------------------------------------------------------------------------
+
 async def _try_cdp_connect() -> bool:
     try:
         st.pw = await async_playwright().start()
@@ -218,6 +260,7 @@ async def _check_login() -> bool:
 async def _ensure():
     if not st.ready:
         await launch_browser()
+    await _ensure_page_alive()
 
 async def _input():
     for sel in ['[role="textbox"]', "textarea", 'div[contenteditable="true"]']:
@@ -259,7 +302,6 @@ async def _extract() -> tuple[str, str]:
             continue
 
     attr = ""
-    # FIX: try dedicated attribution selectors first (Perplexity SPA components)
     for sel in [
         '[data-testid*="attribution"]',
         '[class*="attribution"]',
@@ -278,7 +320,6 @@ async def _extract() -> tuple[str, str]:
         except:
             continue
 
-    # Fallback: scan body text for known attribution patterns
     if not attr:
         try:
             body = await st.page.evaluate("()=>document.body.innerText")
@@ -322,12 +363,10 @@ async def _wait_resp(timeout: int = 90) -> tuple[str, str]:
 async def _switch_model(model: str) -> dict:
     r: dict = {"success": False, "model": model, "note": ""}
 
-    # Ensure we are on the Perplexity home page where the model picker is available
     if "perplexity.ai" not in st.page.url:
         await st.page.goto("https://www.perplexity.ai", wait_until="load")
         await asyncio.sleep(2)
 
-    # Try to find and click the model picker button
     btn = None
     for sel in [
         'button[data-testid*="model" i]',
@@ -355,7 +394,6 @@ async def _switch_model(model: str) -> dict:
         fn = str(DOWNLOADS / "debug_model_btn.png")
         await st.page.screenshot(path=fn)
         r["note"] = "Model button not found — screenshot saved as debug_model_btn.png"
-        # NOTE: do NOT update st.current_model — the switch did not happen
         return r
 
     await btn.click()
@@ -368,7 +406,6 @@ async def _switch_model(model: str) -> dict:
         r.update({"success": True, "note": "Default active"})
         return r
 
-    # Search for the model option inside the opened picker
     clicked = False
     for sel in [
         f'[role="option"]:has-text("{pt}")',
@@ -395,7 +432,6 @@ async def _switch_model(model: str) -> dict:
         await st.page.screenshot(path=fn)
         await st.page.keyboard.press("Escape")
         r["note"] = f"Picker opened but option '{pt}' not found — check debug_model_picker.png"
-        # NOTE: do NOT update st.current_model — actual switch did not happen
 
     return r
 
@@ -536,14 +572,14 @@ async def lifespan(app: FastAPI):
         try: await st.pw.stop()
         except: pass
 
-app = FastAPI(title="Hermes-Perplexity MCP", version="9.2.0", lifespan=lifespan)
+app = FastAPI(title="Hermes-Perplexity MCP", version="9.3.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/sse")
 async def sse_ep(request: Request):
     q: asyncio.Queue = asyncio.Queue()
     clients.append(q)
-    await q.put(json.dumps({"type": "mcp_init", "version": "9.2.0", "tools": MCP_TOOL_DEFS, "models": MODELS}))
+    await q.put(json.dumps({"type": "mcp_init", "version": "9.3.0", "tools": MCP_TOOL_DEFS, "models": MODELS}))
     async def gen():
         try:
             while True:
@@ -568,7 +604,7 @@ async def mcp_ep(req: MCPReq):
         return {"jsonrpc": "2.0", "id": req.id, "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "hermes-perplexity", "version": "9.2.0"}}}
+            "serverInfo": {"name": "hermes-perplexity", "version": "9.3.0"}}}
     if req.method == "tools/list":
         return {"jsonrpc": "2.0", "id": req.id, "result": {"tools": MCP_TOOL_DEFS}}
     if req.method == "tools/call":
@@ -617,7 +653,7 @@ async def status_ep():
         "debug_profile": str(DEBUG_PROFILE),
         "automation_profile": str(AUTO_PROFILE),
         "last_response_length": len(st.last_resp),
-        "version": "9.2.0",
+        "version": "9.3.0",
     }
 
 @app.get("/screenshot/latest")
