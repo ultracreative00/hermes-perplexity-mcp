@@ -171,8 +171,14 @@ function handleEvent(d){
     sending=false;document.getElementById('sendBtn').disabled=false;
     addMsg('ai',d.data.preview+(d.data.preview.length>=300?'…':''),d.data.model);refreshDL();
   }else if(d.type==='model_switched'){
-    document.getElementById('modelStatus').textContent=d.data.note;
+    // Update dropdown to reflect actual model set on server
+    const sel=document.getElementById('modelSel');
+    if(d.data.model){for(let o of sel.options){if(o.value===d.data.model){sel.value=d.data.model;break;}}}
+    document.getElementById('modelStatus').textContent=d.data.success
+      ? '✓ '+d.data.note
+      : '⚠ '+d.data.note;
   }else if(d.type==='tool_start'){
+    // FIX: only tool_start adds the user bubble — send() no longer does
     addMsg('user',d.data.msg||'');
   }else if(d.type==='screenshot_ready'){
     addMsg('system','📷 Screenshot saved: '+d.data.file);refreshDL();
@@ -189,7 +195,7 @@ async function send(){
   const inp=document.getElementById('inp'),msg=inp.value.trim();
   if(!msg||sending)return;
   sending=true;document.getElementById('sendBtn').disabled=true;inp.value='';
-  addMsg('user',msg);
+  // FIX: removed addMsg('user', msg) here — the SSE tool_start event handles the user bubble
   const res=await fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'send_message',arguments:{message:msg}}})});
   const j=await res.json();
@@ -224,7 +230,7 @@ async function checkLogin(){
     body:JSON.stringify({jsonrpc:'2.0',id:6,method:'tools/call',params:{name:'check_login',arguments:{}}})});
   const j=await r.json();
   try{const d=JSON.parse(j.result.content[0].text);
-    addMsg('system',`Login: ${d.logged_in?'✓ Logged in':'⚠ Not logged in'} | Profile: ${d.profile}`);}catch{}
+    addMsg('system',`Login: ${d.logged_in?'✓ Logged in':'⚠ Not logged in'} | Mode: ${d.mode}`);}catch{}
 }
 connectSSE();refreshDL();
 </script>

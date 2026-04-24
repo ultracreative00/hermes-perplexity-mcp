@@ -19,7 +19,6 @@ BASE_DIR     = Path(__file__).parent.parent
 UPLOADS      = BASE_DIR / "uploads"
 DOWNLOADS    = BASE_DIR / "downloads"
 AUTO_PROFILE = BASE_DIR / "chrome-profile"
-# Real Chrome debug profile — matches: google-chrome-stable --remote-debugging-port=9222 --user-data-dir="$HOME/chrome-debug-profile"
 DEBUG_PROFILE = Path.home() / "chrome-debug-profile"
 CDP_URL       = "http://localhost:9222"
 
@@ -67,7 +66,7 @@ class State:
     last_resp = ""
     ready = False
     logged_in = False
-    cdp_mode = False   # True when connected via CDP to real Chrome
+    cdp_mode = False
 
 st = State()
 clients: list[asyncio.Queue] = []
@@ -77,33 +76,19 @@ async def broadcast(t: str, d: dict):
     for q in clients:
         await q.put(msg)
 
-# ---------------------------------------------------------------------------
-# CDP connect helper — attaches to an already-running Chrome on port 9222
-# ---------------------------------------------------------------------------
 async def _try_cdp_connect() -> bool:
-    """
-    Try to connect to a Chrome instance launched with:
-      google-chrome-stable --remote-debugging-port=9222 --user-data-dir="$HOME/chrome-debug-profile"
-
-    Returns True on success, False if no browser is listening on CDP_URL.
-    """
     try:
         st.pw = await async_playwright().start()
         browser = await st.pw.chromium.connect_over_cdp(CDP_URL, timeout=5_000)
         log.info(f"[LAUNCH] ✓ Connected to real Chrome via CDP at {CDP_URL}")
         st.cdp_mode = True
-
-        # Use the first existing context/page, or create one
         contexts = browser.contexts
         if contexts:
             st.ctx = contexts[0]
         else:
             st.ctx = await browser.new_context()
-
         pages = st.ctx.pages
         st.page = pages[0] if pages else await st.ctx.new_page()
-
-        # Navigate to Perplexity if not already there
         if "perplexity.ai" not in st.page.url:
             for attempt in range(1, 4):
                 try:
@@ -112,12 +97,10 @@ async def _try_cdp_connect() -> bool:
                 except Exception as e:
                     log.warning(f"[LAUNCH] Nav attempt {attempt}/3 failed: {e}")
                     await asyncio.sleep(2)
-
         await asyncio.sleep(3)
         return True
     except Exception as e:
         log.info(f"[LAUNCH] CDP connect failed ({e}) — falling back to Playwright launch")
-        # Clean up so we can re-init in the fallback path
         try:
             if st.pw:
                 await st.pw.stop()
@@ -129,9 +112,6 @@ async def _try_cdp_connect() -> bool:
         st.cdp_mode = False
         return False
 
-# ---------------------------------------------------------------------------
-# Fallback: Playwright persistent-context launch (automation profile)
-# ---------------------------------------------------------------------------
 async def _launch_playwright_context():
     profile = str(AUTO_PROFILE)
     log.info("=" * 55)
@@ -140,13 +120,11 @@ async def _launch_playwright_context():
     log.info(f"[LAUNCH] Chrome   = {CHROME_EXE or 'playwright bundled chromium'}")
     log.info(f"[LAUNCH] UID      = {os.getuid()}")
     log.info("=" * 55)
-
     for lock in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
         lp = AUTO_PROFILE / lock
         if lp.exists():
             lp.unlink()
             log.info(f"[LAUNCH] Removed stale lock: {lp.name}")
-
     st.pw = await async_playwright().start()
     args = [
         "--password-store=basic",
@@ -159,7 +137,6 @@ async def _launch_playwright_context():
     ]
     if os.getuid() == 0:
         args.append("--no-sandbox")
-
     kw: dict = dict(
         user_data_dir       = profile,
         headless            = False,
@@ -170,12 +147,10 @@ async def _launch_playwright_context():
     )
     if CHROME_EXE:
         kw["executable_path"] = CHROME_EXE
-
     st.ctx = await st.pw.chromium.launch_persistent_context(**kw)
     await asyncio.sleep(1)
     pages = st.ctx.pages
     st.page = pages[0] if pages else await st.ctx.new_page()
-
     for attempt in range(1, 4):
         try:
             await st.page.goto("https://www.perplexity.ai", wait_until="load", timeout=30_000)
@@ -183,27 +158,17 @@ async def _launch_playwright_context():
         except Exception as e:
             log.warning(f"[LAUNCH] Nav attempt {attempt}/3 failed: {e}")
             await asyncio.sleep(2)
-
     await asyncio.sleep(3)
 
-# ---------------------------------------------------------------------------
-# Main launch entry point
-# ---------------------------------------------------------------------------
 async def launch_browser():
     try:
-        # 1. Try CDP first (real Chrome, no bot-detection)
         cdp_ok = await _try_cdp_connect()
-
         if not cdp_ok:
-            # 2. Fall back to Playwright launch
             await _launch_playwright_context()
-
         st.logged_in = await _check_login()
         st.ready = True
-
         mode = "CDP (real Chrome)" if st.cdp_mode else "Playwright (automation)"
         log.info(f"[LAUNCH] READY — mode={mode} logged_in={st.logged_in}")
-
         if st.cdp_mode:
             note = (
                 "✓ Connected to your real Chrome via CDP. Already logged in!"
@@ -225,14 +190,12 @@ async def launch_browser():
                     "Then restart the MCP server."
                 )
             )
-
         await broadcast("browser_ready", {
             "logged_in": st.logged_in,
             "url": st.page.url,
             "mode": mode,
             "note": note,
         })
-
     except Exception as e:
         log.error(f"[LAUNCH] FATAL: {e}")
         log.error(traceback.format_exc())
@@ -279,7 +242,7 @@ async def _submit():
             return
     await st.page.keyboard.press("Enter")
 
-ATTR_PATTERNS = ["Prepared using", "Generated by", "Powered by", "Answer by", "Using model"]
+ATTR_PATTERNS = ["Prepared using", "Generated by", "Powered by", "Answer by", "Using model", "with ", "via "]
 
 async def _extract() -> tuple[str, str]:
     best = ""
@@ -294,16 +257,39 @@ async def _extract() -> tuple[str, str]:
                 best = t
         except:
             continue
+
     attr = ""
-    try:
-        body = await st.page.evaluate("()=>document.body.innerText")
-        for line in body.splitlines():
-            ls = line.strip()
-            if any(p.lower() in ls.lower() for p in ATTR_PATTERNS) and len(ls) < 120:
-                attr = ls
-                break
-    except:
-        pass
+    # FIX: try dedicated attribution selectors first (Perplexity SPA components)
+    for sel in [
+        '[data-testid*="attribution"]',
+        '[class*="attribution"]',
+        '[class*="model-label"]',
+        '[class*="ModelTag"]',
+        'span[class*="source"]',
+        'div[class*="footer"] span',
+    ]:
+        try:
+            el = st.page.locator(sel).first
+            if await el.count() > 0:
+                txt = (await el.inner_text()).strip()
+                if txt:
+                    attr = txt
+                    break
+        except:
+            continue
+
+    # Fallback: scan body text for known attribution patterns
+    if not attr:
+        try:
+            body = await st.page.evaluate("()=>document.body.innerText")
+            for line in body.splitlines():
+                ls = line.strip()
+                if any(p.lower() in ls.lower() for p in ATTR_PATTERNS) and len(ls) < 120:
+                    attr = ls
+                    break
+        except:
+            pass
+
     if attr:
         for m in MODELS:
             if m.lower() in attr.lower():
@@ -335,49 +321,82 @@ async def _wait_resp(timeout: int = 90) -> tuple[str, str]:
 
 async def _switch_model(model: str) -> dict:
     r: dict = {"success": False, "model": model, "note": ""}
+
+    # Ensure we are on the Perplexity home page where the model picker is available
+    if "perplexity.ai" not in st.page.url:
+        await st.page.goto("https://www.perplexity.ai", wait_until="load")
+        await asyncio.sleep(2)
+
+    # Try to find and click the model picker button
     btn = None
-    for sel in ['button[aria-label*="model" i]', 'button:has-text("Default")', 'button:has-text("Claude")',
-                'button:has-text("GPT")', 'button:has-text("Gemini")', 'button:has-text("Sonar")',
-                'button:has-text("R1")', 'div[class*="toolbar"] button']:
+    for sel in [
+        'button[data-testid*="model" i]',
+        '[aria-label*="model" i]',
+        'button:has-text("Default")', 'button:has-text("Claude")',
+        'button:has-text("GPT")',     'button:has-text("Gemini")',
+        'button:has-text("Sonar")',   'button:has-text("R1")',
+        'div[class*="toolbar"] button',
+        '.grow button',
+        'form button:not([aria-label*="submit" i])',
+    ]:
         try:
             loc = st.page.locator(sel).first
             if await loc.count() > 0 and await loc.is_visible():
                 lbl = (await loc.get_attribute("aria-label") or "").lower()
-                if any(x in lbl for x in ["send", "submit", "attach", "upload"]):
+                txt = (await loc.inner_text() or "").lower()
+                if any(x in lbl or x in txt for x in ["send", "submit", "attach", "upload", "search"]):
                     continue
                 btn = loc
                 break
         except:
             continue
+
     if not btn:
-        await st.page.screenshot(path=str(DOWNLOADS / "debug_model.png"))
-        r["note"] = "Model btn not found — screenshot saved"
-        st.current_model = model
+        fn = str(DOWNLOADS / "debug_model_btn.png")
+        await st.page.screenshot(path=fn)
+        r["note"] = "Model button not found — screenshot saved as debug_model_btn.png"
+        # NOTE: do NOT update st.current_model — the switch did not happen
         return r
+
     await btn.click()
-    await asyncio.sleep(1)
+    await asyncio.sleep(1.5)
+
     pt = MODEL_LABEL.get(model)
     if not pt:
         await st.page.keyboard.press("Escape")
         st.current_model = "Default"
         r.update({"success": True, "note": "Default active"})
         return r
-    for sel in [f'[role="option"]:has-text("{pt}")', f'li:has-text("{pt}")',
-                f'button:has-text("{pt}")', f'div[role="menuitem"]:has-text("{pt}")']:
+
+    # Search for the model option inside the opened picker
+    clicked = False
+    for sel in [
+        f'[role="option"]:has-text("{pt}")',
+        f'li:has-text("{pt}")',
+        f'button:has-text("{pt}")',
+        f'div[role="menuitem"]:has-text("{pt}")',
+        f'[role="radio"]:has-text("{pt}")',
+        f'label:has-text("{pt}")',
+    ]:
         try:
             opt = st.page.locator(sel).first
             if await opt.count() > 0 and await opt.is_visible():
                 await opt.click()
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(1)
                 st.current_model = model
                 r.update({"success": True, "note": f"Selected {pt}"})
-                return r
+                clicked = True
+                break
         except:
             continue
-    await st.page.screenshot(path=str(DOWNLOADS / "debug_picker.png"))
-    await st.page.keyboard.press("Escape")
-    r["note"] = f"Option '{pt}' not found in picker"
-    st.current_model = model
+
+    if not clicked:
+        fn = str(DOWNLOADS / "debug_model_picker.png")
+        await st.page.screenshot(path=fn)
+        await st.page.keyboard.press("Escape")
+        r["note"] = f"Picker opened but option '{pt}' not found — check debug_model_picker.png"
+        # NOTE: do NOT update st.current_model — actual switch did not happen
+
     return r
 
 async def tool_send_message(p: dict) -> dict:
@@ -511,21 +530,20 @@ async def lifespan(app: FastAPI):
     yield
     if not task.done(): task.cancel()
     if st.ctx and not st.cdp_mode:
-        # Only close context if we own it (Playwright mode). In CDP mode the user owns Chrome.
         try: await st.ctx.close()
         except: pass
     if st.pw:
         try: await st.pw.stop()
         except: pass
 
-app = FastAPI(title="Hermes-Perplexity MCP", version="9.1.0", lifespan=lifespan)
+app = FastAPI(title="Hermes-Perplexity MCP", version="9.2.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/sse")
 async def sse_ep(request: Request):
     q: asyncio.Queue = asyncio.Queue()
     clients.append(q)
-    await q.put(json.dumps({"type": "mcp_init", "version": "9.1.0", "tools": MCP_TOOL_DEFS, "models": MODELS}))
+    await q.put(json.dumps({"type": "mcp_init", "version": "9.2.0", "tools": MCP_TOOL_DEFS, "models": MODELS}))
     async def gen():
         try:
             while True:
@@ -550,7 +568,7 @@ async def mcp_ep(req: MCPReq):
         return {"jsonrpc": "2.0", "id": req.id, "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "hermes-perplexity", "version": "9.1.0"}}}
+            "serverInfo": {"name": "hermes-perplexity", "version": "9.2.0"}}}
     if req.method == "tools/list":
         return {"jsonrpc": "2.0", "id": req.id, "result": {"tools": MCP_TOOL_DEFS}}
     if req.method == "tools/call":
@@ -599,7 +617,7 @@ async def status_ep():
         "debug_profile": str(DEBUG_PROFILE),
         "automation_profile": str(AUTO_PROFILE),
         "last_response_length": len(st.last_resp),
-        "version": "9.1.0",
+        "version": "9.2.0",
     }
 
 @app.get("/screenshot/latest")
