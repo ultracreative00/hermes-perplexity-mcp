@@ -253,6 +253,20 @@ async def launch_browser():
 
 async def _check_login() -> bool:
     try:
+        # Primary check: the specific XPath element confirmed by user
+        LOGIN_XPATH = (
+            "/html/body/div[1]/div/div/div/div/nav"
+            "/div/div[1]/div[3]/div/div[2]/div/div/div"
+            "/button/div/div/div/div/div/div/div[1]/div"
+        )
+        try:
+            el = st.page.locator(f"xpath={LOGIN_XPATH}").first
+            if await el.count() > 0:
+                log.info("[LOGIN] ✓ Detected via XPath login element")
+                return True
+        except Exception:
+            pass
+
         has_auth_cookie = await st.page.evaluate("""() => {
             const cookieStr = document.cookie;
             const authKeys = ['pplx_auth', '__session', 'next-auth.session-token',
@@ -323,18 +337,37 @@ async def _ensure():
         await launch_browser()
     await _ensure_page_alive()
 
+# ---------------------------------------------------------------------------
+# FIX: Sticky overlay intercepts click — use JS click + scroll workaround
+# ---------------------------------------------------------------------------
 async def _input():
     for sel in ['[role="textbox"]', "textarea", 'div[contenteditable="true"]']:
         el = st.page.locator(sel).first
         if await el.count() > 0:
-            return el
-    return None
+            return el, sel
+    return None, None
 
 async def _type(text: str):
-    el = await _input()
+    el, sel = await _input()
     if not el:
         raise RuntimeError("No chat input found on page")
-    await el.click()
+
+    # Scroll the sticky header out of the way first, then use JS focus + fill
+    # to avoid the sticky overlay intercepting pointer events.
+    await st.page.evaluate("""
+    (sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return;
+        // Scroll element into view with offset to clear sticky headers
+        const rect = el.getBoundingClientRect();
+        const scrollY = window.scrollY + rect.top - 120;
+        window.scrollTo({ top: scrollY > 0 ? scrollY : 0, behavior: 'instant' });
+        el.focus();
+    }
+    """, sel)
+    await asyncio.sleep(0.3)
+
+    # Select all existing text and replace with new message
     await st.page.keyboard.press("Control+a")
     await el.fill(text)
 
@@ -428,19 +461,11 @@ def _format_sources(sources: list[dict]) -> str:
     return '\n'.join(lines)
 
 # ---------------------------------------------------------------------------
-# FIX: Extract ONLY the LAST answer block, not all answers on the page.
-# This prevents response stacking when multiple Q&As exist in one thread.
+# Extract ONLY the LAST answer block (no stacking)
 # ---------------------------------------------------------------------------
 
 async def _extract_last_answer() -> tuple[str, str]:
-    """
-    Extract only the most recent (last) answer block from the Perplexity page.
-    Returns (answer_text, attribution).
-    """
-    # Try to grab the last answer block specifically
     last_answer = ""
-
-    # Strategy 1: find all answer/prose blocks and take only the LAST one
     for sel in [
         '[data-testid="answer-text"]',
         'div[class*="prose"]',
@@ -453,7 +478,6 @@ async def _extract_last_answer() -> tuple[str, str]:
             count = await els.count()
             if count == 0:
                 continue
-            # Take ONLY the last element (most recent answer)
             last_el = els.nth(count - 1)
             text = (await last_el.inner_text()).strip()
             if len(text) > len(last_answer):
@@ -461,12 +485,10 @@ async def _extract_last_answer() -> tuple[str, str]:
         except Exception:
             continue
 
-    # Strategy 2: JS-based — find the last assistant message container
     if not last_answer:
         try:
             last_answer = await st.page.evaluate("""
             () => {
-                // Try common assistant message wrappers, pick the last one
                 const selectors = [
                     '[data-testid="answer-text"]',
                     '[class*="prose"]',
@@ -486,7 +508,6 @@ async def _extract_last_answer() -> tuple[str, str]:
         except Exception:
             pass
 
-    # Attribution
     attr = ""
     for sel in [
         '[data-testid*="attribution"]', '[class*="attribution"]',
@@ -527,9 +548,8 @@ async def _extract_last_answer() -> tuple[str, str]:
 
     return last_answer, attr
 
-# Keep _extract() as a full-page fallback for snapshot/baseline purposes only
 async def _extract() -> tuple[str, str]:
-    """Full-page extraction — used only for baseline snapshots before sending."""
+    """Full-page extraction — used only for baseline snapshots."""
     best = ""
     for sel in [
         '[data-testid="answer-text"]', 'div[class*="prose"]', 'div[class*="answer"]',
@@ -556,7 +576,6 @@ async def _extract() -> tuple[str, str]:
     return best, ""
 
 async def _snapshot_text() -> str:
-    """Grab current full-page text as a baseline before sending a new message."""
     try:
         text, _ = await _extract()
         return text
@@ -564,10 +583,6 @@ async def _snapshot_text() -> str:
         return ""
 
 async def _wait_resp(baseline: str = "", timeout: int = 90) -> tuple[str, str]:
-    """
-    Wait until the last answer block is stable and different from baseline.
-    Returns only the isolated last answer, not the full page.
-    """
     await asyncio.sleep(2)
     deadline = time.time() + timeout
     prev = ""
@@ -582,14 +597,12 @@ async def _wait_resp(baseline: str = "", timeout: int = 90) -> tuple[str, str]:
         except Exception:
             pass
 
-        # Use full-page text to check if baseline has been replaced
         full_text, _ = await _extract()
         if baseline and full_text and full_text.strip() == baseline.strip():
             stable = 0
             prev = ""
             continue
 
-        # Once we know new content is on the page, extract ONLY the last answer
         text, attr = await _extract_last_answer()
 
         if text and text == prev:
@@ -707,11 +720,10 @@ async def _switch_model(model: str) -> dict:
     return r
 
 # ---------------------------------------------------------------------------
-# Core send logic — retryable
+# Core send logic
 # ---------------------------------------------------------------------------
 
 async def _do_send(msg: str, attach: str, timeout: int) -> tuple[str, str]:
-    """Type, submit, wait for the isolated last-answer response."""
     baseline = await _snapshot_text()
     if "perplexity.ai" not in st.page.url:
         log.info("[SEND] Not on perplexity.ai — navigating home first")
@@ -733,7 +745,6 @@ async def tool_send_message(p: dict) -> dict:
     if not msg:
         return {"error": "message is required"}
 
-    # Auto-inject memory context if any memories exist
     if memory:
         mem_lines = [f"- {k}: {v}" for k, v in memory.items()]
         context_prefix = "[Context from memory]\n" + "\n".join(mem_lines) + "\n\n"
@@ -774,7 +785,7 @@ async def tool_send_message(p: dict) -> dict:
     mdl = st.detected_model or st.current_model
     fname = f"response_{int(time.time())}.txt"
     async with aiofiles.open(DOWNLOADS / fname, "w") as f:
-        await f.write(f"Model: {mdl}\nAttribution: {attr}\n{'\u2500'*60}\n{resp}")
+        await f.write(f"Model: {mdl}\nAttribution: {attr}\n{'─'*60}\n{resp}")
     await broadcast("response_ready", {
         "preview": resp[:300],
         "full": resp,
@@ -864,10 +875,6 @@ async def tool_check_login(p: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 async def tool_memory_set(p: dict) -> dict:
-    """
-    Store a key-value fact in persistent memory.
-    Hermes can call this to remember things about the user or session.
-    """
     key = p.get("key", "").strip()
     value = p.get("value", "").strip()
     if not key:
@@ -883,7 +890,6 @@ async def tool_memory_set(p: dict) -> dict:
     return {"success": True, "key": key, "value": value, "total_memories": len(memory)}
 
 async def tool_memory_get(p: dict) -> dict:
-    """Retrieve a specific memory by key, or all memories if no key given."""
     key = p.get("key", "").strip()
     if key:
         val = memory.get(key)
@@ -893,7 +899,6 @@ async def tool_memory_get(p: dict) -> dict:
     return {"memories": dict(memory), "count": len(memory)}
 
 async def tool_memory_delete(p: dict) -> dict:
-    """Delete a memory entry by key."""
     key = p.get("key", "").strip()
     if not key:
         return {"error": "key is required"}
@@ -921,7 +926,7 @@ TOOLS = {
 
 MCP_TOOL_DEFS = [
     {"name": "send_message",
-     "description": "Type a message into Perplexity and return ONLY the latest isolated response. Memory context is automatically prepended if any memories are stored.",
+     "description": "Type a message into Perplexity and return ONLY the latest isolated response.",
      "inputSchema": {"type": "object", "properties": {
          "message": {"type": "string"},
          "timeout": {"type": "integer", "default": 90}
@@ -951,18 +956,18 @@ MCP_TOOL_DEFS = [
      "description": "List all available Perplexity models and the currently active one",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "check_login",
-     "description": "Check whether Perplexity is currently logged in and show connection mode",
+     "description": "Check whether Perplexity is currently logged in",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "memory_set",
-     "description": "Store a persistent key-value memory fact. Pass empty value to delete. Memories are auto-injected as context into every send_message call.",
+     "description": "Store a persistent key-value memory. Auto-injected as context into every send_message.",
      "inputSchema": {"type": "object", "properties": {
-         "key": {"type": "string", "description": "Memory key, e.g. 'user_name', 'user_location', 'preferred_language'"},
-         "value": {"type": "string", "description": "Value to store. Pass empty string to delete this key."}
+         "key": {"type": "string"},
+         "value": {"type": "string", "description": "Pass empty string to delete."}
      }, "required": ["key", "value"]}},
     {"name": "memory_get",
-     "description": "Retrieve a specific memory by key, or all memories if no key is provided.",
+     "description": "Retrieve a memory by key, or all memories if no key given.",
      "inputSchema": {"type": "object", "properties": {
-         "key": {"type": "string", "description": "Key to look up. Omit to get all memories."}
+         "key": {"type": "string"}
      }}},
     {"name": "memory_delete",
      "description": "Delete a memory entry by key.",
@@ -987,14 +992,14 @@ async def lifespan(app: FastAPI):
         try: await st.pw.stop()
         except Exception: pass
 
-app = FastAPI(title="Hermes-Perplexity MCP", version="9.9.0", lifespan=lifespan)
+app = FastAPI(title="Hermes-Perplexity MCP", version="9.9.1", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/sse")
 async def sse_ep(request: Request):
     q: asyncio.Queue = asyncio.Queue()
     clients.append(q)
-    await q.put(json.dumps({"type": "mcp_init", "version": "9.9.0", "tools": MCP_TOOL_DEFS, "models": MODELS}))
+    await q.put(json.dumps({"type": "mcp_init", "version": "9.9.1", "tools": MCP_TOOL_DEFS, "models": MODELS}))
     async def gen():
         try:
             while True:
@@ -1019,7 +1024,7 @@ async def mcp_ep(req: MCPReq):
         return {"jsonrpc": "2.0", "id": req.id, "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "hermes-perplexity", "version": "9.9.0"}}}
+            "serverInfo": {"name": "hermes-perplexity", "version": "9.9.1"}}}
     if req.method == "tools/list":
         return {"jsonrpc": "2.0", "id": req.id, "result": {"tools": MCP_TOOL_DEFS}}
     if req.method == "tools/call":
@@ -1069,7 +1074,7 @@ async def status_ep():
         "debug_profile": str(DEBUG_PROFILE), "automation_profile": str(AUTO_PROFILE),
         "last_response_length": len(st.last_resp),
         "memory_count": len(memory),
-        "version": "9.9.0",
+        "version": "9.9.1",
     }
 
 @app.get("/screenshot/latest")
