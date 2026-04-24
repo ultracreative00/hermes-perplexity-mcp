@@ -214,17 +214,112 @@ async def launch_browser():
         await broadcast("browser_error", {"error": str(e), "traceback": traceback.format_exc()})
 
 async def _check_login() -> bool:
+    """
+    Robust login detection for Perplexity.ai.
+    Strategy (in order of reliability):
+      1. JS cookie scan — pplx_auth, __session, next-auth.session-token, pplx_user
+      2. JS localStorage scan — pplx.user, user, auth, session
+      3. Wide DOM selector scan — avatars, account menus, profile links
+      4. Absence of Sign-in button (last resort)
+    Returns True if any signal confirms a logged-in session.
+    """
     try:
-        for sel in ['a:has-text("Sign in")', 'button:has-text("Sign in")', 'a:has-text("Log in")', 'button:has-text("Log in")']:
-            el = st.page.locator(sel).first
-            if await el.count() > 0 and await el.is_visible():
-                return False
-        for sel in ['img[alt*="avatar" i]', 'button[aria-label*="account" i]', 'a[href*="/settings"]', 'div[class*="UserAvatar"]', 'img[src*="googleusercontent"]']:
-            if await st.page.locator(sel).first.count() > 0:
-                return True
+        # 1. Cookie-based check (most reliable)
+        has_auth_cookie = await st.page.evaluate("""() => {
+            const cookieStr = document.cookie;
+            const authKeys = ['pplx_auth', '__session', 'next-auth.session-token',
+                              'pplx_user', 'pplx-session', '__Secure-next-auth',
+                              'auth_token', 'user_id', 'session'];
+            return authKeys.some(k => cookieStr.includes(k));
+        }""")
+        if has_auth_cookie:
+            log.info("[LOGIN] ✓ Detected via auth cookie")
+            return True
+
+        # 2. localStorage-based check
+        has_local_storage = await st.page.evaluate("""() => {
+            try {
+                const keys = ['pplx.user', 'user', 'auth', 'session',
+                              'next-auth.session-token', 'pplx_user', 'currentUser'];
+                return keys.some(k => {
+                    const v = localStorage.getItem(k);
+                    return v && v.length > 0;
+                });
+            } catch(e) { return false; }
+        }""")
+        if has_local_storage:
+            log.info("[LOGIN] ✓ Detected via localStorage")
+            return True
+
+        # 3. Wide DOM selector scan
+        logged_in_selectors = [
+            # Avatar / profile images
+            'img[alt*="avatar" i]',
+            'img[alt*="profile" i]',
+            'img[alt*="user" i]',
+            'img[src*="googleusercontent"]',
+            'img[src*="avatar"]',
+            'img[src*="profile"]',
+            # Account / user UI elements
+            'button[aria-label*="account" i]',
+            'button[aria-label*="user" i]',
+            'button[aria-label*="profile" i]',
+            'button[aria-label*="menu" i]',
+            '[data-testid*="user" i]',
+            '[data-testid*="avatar" i]',
+            '[data-testid*="account" i]',
+            '[data-testid*="profile" i]',
+            # Settings / account links
+            'a[href*="/settings"]',
+            'a[href*="/account"]',
+            'a[href*="/profile"]',
+            # Class-based (common React patterns)
+            'div[class*="UserAvatar"]',
+            'div[class*="userAvatar"]',
+            'div[class*="Avatar"]',
+            'div[class*="ProfilePic"]',
+            'div[class*="accountMenu"]',
+            'div[class*="userMenu"]',
+            # Perplexity-specific patterns
+            '[class*="UserCircle"]',
+            '[class*="userCircle"]',
+            'button[class*="account"]',
+            'span[class*="username"]',
+        ]
+        for sel in logged_in_selectors:
+            try:
+                loc = st.page.locator(sel).first
+                if await loc.count() > 0:
+                    log.info(f"[LOGIN] ✓ Detected via DOM selector: {sel}")
+                    return True
+            except Exception:
+                continue
+
+        # 4. Absence of Sign-in button (last resort — weakest signal)
+        signin_visible = False
+        for sel in [
+            'a:has-text("Sign in")', 'button:has-text("Sign in")',
+            'a:has-text("Log in")', 'button:has-text("Log in")',
+            'a:has-text("Sign up")', 'button:has-text("Sign up")',
+        ]:
+            try:
+                el = st.page.locator(sel).first
+                if await el.count() > 0 and await el.is_visible():
+                    signin_visible = True
+                    break
+            except Exception:
+                continue
+
+        # If no sign-in button found, assume logged in
+        if not signin_visible:
+            log.info("[LOGIN] ✓ No sign-in button visible — assuming logged in")
+            return True
+
+        log.info("[LOGIN] ✗ Not logged in — sign-in button found and no auth signals detected")
         return False
+
     except Exception as e:
-        log.debug(f"[LOGIN] check error: {e}")
+        log.warning(f"[LOGIN] check error: {e}")
         return False
 
 async def _ensure():
@@ -405,7 +500,6 @@ async def tool_send_message(p: dict) -> dict:
     msg = p.get("message", "").strip()
     if not msg:
         return {"error": "message is required"}
-    # Include pending attach name in tool_start so dashboard can show it in bubble
     attach = st.pending_attach
     st.pending_attach = ""
     await broadcast("tool_start", {"tool": "send_message", "msg": msg[:80], "attach": attach})
@@ -447,7 +541,7 @@ async def tool_upload_file(p: dict) -> dict:
     if not fp.exists():
         return {"error": f"File not found in uploads/: {fn}"}
     original = p.get("original", fn)
-    st.pending_attach = original  # remember for next send_message bubble
+    st.pending_attach = original
     for sel in ['button[aria-label*="ttach" i]', 'input[type="file"]']:
         loc = st.page.locator(sel).first
         if await loc.count() == 0:
@@ -489,6 +583,17 @@ async def tool_check_login(p: dict) -> dict:
     li = await _check_login()
     st.logged_in = li
     mode = "CDP (real Chrome)" if st.cdp_mode else "Playwright (automation)"
+    note = (
+        "✓ Logged in successfully!"
+        if li else
+        "⚠ Not logged in. Please sign into Perplexity in the browser window."
+    )
+    await broadcast("browser_ready", {
+        "logged_in": li,
+        "url": st.page.url,
+        "mode": mode,
+        "note": note,
+    })
     return {
         "logged_in": li, "mode": mode, "cdp_url": CDP_URL,
         "debug_profile": str(DEBUG_PROFILE), "automation_profile": str(AUTO_PROFILE),
@@ -545,14 +650,14 @@ async def lifespan(app: FastAPI):
         try: await st.pw.stop()
         except: pass
 
-app = FastAPI(title="Hermes-Perplexity MCP", version="9.5.0", lifespan=lifespan)
+app = FastAPI(title="Hermes-Perplexity MCP", version="9.5.1", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/sse")
 async def sse_ep(request: Request):
     q: asyncio.Queue = asyncio.Queue()
     clients.append(q)
-    await q.put(json.dumps({"type": "mcp_init", "version": "9.5.0", "tools": MCP_TOOL_DEFS, "models": MODELS}))
+    await q.put(json.dumps({"type": "mcp_init", "version": "9.5.1", "tools": MCP_TOOL_DEFS, "models": MODELS}))
     async def gen():
         try:
             while True:
@@ -577,7 +682,7 @@ async def mcp_ep(req: MCPReq):
         return {"jsonrpc": "2.0", "id": req.id, "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "hermes-perplexity", "version": "9.5.0"}}}
+            "serverInfo": {"name": "hermes-perplexity", "version": "9.5.1"}}}
     if req.method == "tools/list":
         return {"jsonrpc": "2.0", "id": req.id, "result": {"tools": MCP_TOOL_DEFS}}
     if req.method == "tools/call":
@@ -621,7 +726,7 @@ async def status_ep():
         "detected_model": st.detected_model, "sse_clients": len(clients),
         "chrome_exe": CHROME_EXE or "playwright bundled chromium",
         "debug_profile": str(DEBUG_PROFILE), "automation_profile": str(AUTO_PROFILE),
-        "last_response_length": len(st.last_resp), "version": "9.5.0",
+        "last_response_length": len(st.last_resp), "version": "9.5.1",
     }
 
 @app.get("/screenshot/latest")
