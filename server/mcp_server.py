@@ -253,7 +253,6 @@ async def launch_browser():
 
 async def _check_login() -> bool:
     try:
-        # Primary check: the specific XPath element confirmed by user
         LOGIN_XPATH = (
             "/html/body/div[1]/div/div/div/div/nav"
             "/div/div[1]/div[3]/div/div[2]/div/div/div"
@@ -338,46 +337,215 @@ async def _ensure():
     await _ensure_page_alive()
 
 # ---------------------------------------------------------------------------
-# FIX: Sticky overlay intercepts click — use JS click + scroll workaround
+# _type() — clipboard-paste strategy so React state updates correctly
+# _submit() — Enter key primary, JS click fallback (no .click() overlay issue)
 # ---------------------------------------------------------------------------
-async def _input():
-    for sel in ['[role="textbox"]', "textarea", 'div[contenteditable="true"]']:
-        el = st.page.locator(sel).first
-        if await el.count() > 0:
-            return el, sel
+
+async def _find_input():
+    """Return the first visible chat input element and its selector."""
+    for sel in [
+        'textarea',
+        '[role="textbox"]',
+        'div[contenteditable="true"]',
+        'p[data-placeholder]',
+    ]:
+        try:
+            el = st.page.locator(sel).first
+            if await el.count() > 0 and await el.is_visible(timeout=2_000):
+                return el, sel
+        except Exception:
+            continue
     return None, None
 
 async def _type(text: str):
-    el, sel = await _input()
+    """
+    Inject text into Perplexity's chat input.
+
+    Strategy (in order):
+    1. Write text to clipboard via JS, then Ctrl+A + Ctrl+V to paste.
+       Paste fires the native InputEvent that React listens to, so the
+       Submit button becomes enabled without any pointer-event tricks.
+    2. If clipboard API is blocked, fall back to keyboard.type() character
+       by character (slow but reliable).
+    """
+    el, sel = await _find_input()
     if not el:
         raise RuntimeError("No chat input found on page")
 
-    # Scroll the sticky header out of the way first, then use JS focus + fill
-    # to avoid the sticky overlay intercepting pointer events.
+    log.info(f"[TYPE] Using selector: {sel}")
+
+    # Focus the element via JS — avoids any sticky overlay interception
     await st.page.evaluate("""
     (sel) => {
         const el = document.querySelector(sel);
         if (!el) return;
-        // Scroll element into view with offset to clear sticky headers
-        const rect = el.getBoundingClientRect();
-        const scrollY = window.scrollY + rect.top - 120;
-        window.scrollTo({ top: scrollY > 0 ? scrollY : 0, behavior: 'instant' });
         el.focus();
+        // Scroll clear of sticky headers
+        const rect = el.getBoundingClientRect();
+        if (rect.top < 150) {
+            window.scrollTo({ top: Math.max(0, window.scrollY + rect.top - 150), behavior: 'instant' });
+        }
     }
     """, sel)
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.2)
 
-    # Select all existing text and replace with new message
+    # Clear any existing content
     await st.page.keyboard.press("Control+a")
-    await el.fill(text)
+    await asyncio.sleep(0.1)
+
+    # Strategy 1: clipboard paste (triggers React synthetic events)
+    try:
+        pasted = await st.page.evaluate("""
+        async (txt) => {
+            try {
+                await navigator.clipboard.writeText(txt);
+                return true;
+            } catch(e) {
+                // Clipboard API blocked — signal fallback needed
+                return false;
+            }
+        }
+        """, text)
+
+        if pasted:
+            await st.page.keyboard.press("Control+v")
+            await asyncio.sleep(0.3)
+            # Verify text actually appeared
+            appeared = await st.page.evaluate("""
+            (sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return false;
+                const val = el.value || el.textContent || el.innerText || '';
+                return val.trim().length > 0;
+            }
+            """, sel)
+            if appeared:
+                log.info("[TYPE] ✓ Text injected via clipboard paste")
+                return
+            log.warning("[TYPE] Clipboard paste succeeded but text not visible — trying fallback")
+        else:
+            log.warning("[TYPE] Clipboard API blocked — using keyboard fallback")
+    except Exception as e:
+        log.warning(f"[TYPE] Clipboard strategy failed ({e}) — using keyboard fallback")
+
+    # Strategy 2: JS execCommand insertText (fires InputEvent, works in contenteditable)
+    try:
+        ok = await st.page.evaluate("""
+        (args) => {
+            const { sel, txt } = args;
+            const el = document.querySelector(sel);
+            if (!el) return false;
+            el.focus();
+            // Select all first
+            document.execCommand('selectAll', false, null);
+            return document.execCommand('insertText', false, txt);
+        }
+        """, {"sel": sel, "txt": text})
+        if ok:
+            await asyncio.sleep(0.2)
+            log.info("[TYPE] ✓ Text injected via execCommand insertText")
+            return
+    except Exception as e:
+        log.warning(f"[TYPE] execCommand strategy failed ({e})")
+
+    # Strategy 3: keyboard.type() — slow but always works
+    log.info("[TYPE] Using keyboard.type() fallback (slow)")
+    await el.focus()
+    await st.page.keyboard.press("Control+a")
+    await st.page.keyboard.type(text, delay=20)
+    log.info("[TYPE] ✓ Text injected via keyboard.type()")
+
 
 async def _submit():
-    for sel in ['button[aria-label*="Submit" i]', 'button[type="submit"]', 'button[aria-label*="Ask" i]']:
-        b = st.page.locator(sel).first
-        if await b.count() > 0:
-            await b.click()
-            return
+    """
+    Submit the message.
+
+    Strategy (in order):
+    1. keyboard.press("Enter") — works after the input is focused and text is
+       present; avoids all pointer-event / overlay issues entirely.
+    2. JS dispatchEvent click on the Submit button — bypasses CSS interception.
+    3. Playwright .click() with force=True as last resort.
+    """
+    await asyncio.sleep(0.3)  # Let React process the input event
+
+    # Strategy 1: Enter key (most reliable — no pointer events needed)
+    _, sel = await _find_input()
+    if sel:
+        await st.page.focus(sel)
     await st.page.keyboard.press("Enter")
+    await asyncio.sleep(0.5)
+
+    # Check if submission happened (Stop button appears or URL changes)
+    submitted = False
+    try:
+        stop_visible = await st.page.locator(
+            'button[aria-label*="Stop" i], button:has-text("Stop")'
+        ).first.is_visible(timeout=2_000)
+        if stop_visible:
+            submitted = True
+    except Exception:
+        pass
+
+    if submitted:
+        log.info("[SUBMIT] ✓ Submitted via Enter key")
+        return
+
+    log.warning("[SUBMIT] Enter key didn't trigger submission — trying JS click on Submit button")
+
+    # Strategy 2: JS dispatchEvent — bypasses pointer-event interception
+    js_submitted = await st.page.evaluate("""
+    () => {
+        const selectors = [
+            'button[aria-label*="Submit" i]',
+            'button[type="submit"]',
+            'button[aria-label*="Ask" i]',
+            'button[aria-label*="Send" i]',
+        ];
+        for (const sel of selectors) {
+            const btn = document.querySelector(sel);
+            if (btn && !btn.disabled) {
+                btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                return true;
+            }
+        }
+        // Try any visible non-disabled button near the input
+        const btns = Array.from(document.querySelectorAll('button'));
+        for (const btn of btns) {
+            const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+            if ((label.includes('submit') || label.includes('send') || label.includes('ask'))
+                && !btn.disabled) {
+                btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                return true;
+            }
+        }
+        return false;
+    }
+    """)
+
+    if js_submitted:
+        log.info("[SUBMIT] ✓ Submitted via JS dispatchEvent click")
+        return
+
+    log.warning("[SUBMIT] JS click failed — trying force click as last resort")
+
+    # Strategy 3: Playwright force click (last resort)
+    for sel in [
+        'button[aria-label*="Submit" i]',
+        'button[type="submit"]',
+        'button[aria-label*="Ask" i]',
+    ]:
+        try:
+            b = st.page.locator(sel).first
+            if await b.count() > 0:
+                await b.click(force=True, timeout=5_000)
+                log.info(f"[SUBMIT] ✓ Submitted via force click on {sel}")
+                return
+        except Exception as e:
+            log.warning(f"[SUBMIT] Force click on {sel} failed: {e}")
+            continue
+
+    log.error("[SUBMIT] All submit strategies exhausted")
+
 
 ATTR_PATTERNS = ["Prepared using", "Generated by", "Powered by", "Answer by", "Using model", "with ", "via "]
 
@@ -992,14 +1160,14 @@ async def lifespan(app: FastAPI):
         try: await st.pw.stop()
         except Exception: pass
 
-app = FastAPI(title="Hermes-Perplexity MCP", version="9.9.1", lifespan=lifespan)
+app = FastAPI(title="Hermes-Perplexity MCP", version="9.9.2", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/sse")
 async def sse_ep(request: Request):
     q: asyncio.Queue = asyncio.Queue()
     clients.append(q)
-    await q.put(json.dumps({"type": "mcp_init", "version": "9.9.1", "tools": MCP_TOOL_DEFS, "models": MODELS}))
+    await q.put(json.dumps({"type": "mcp_init", "version": "9.9.2", "tools": MCP_TOOL_DEFS, "models": MODELS}))
     async def gen():
         try:
             while True:
@@ -1024,7 +1192,7 @@ async def mcp_ep(req: MCPReq):
         return {"jsonrpc": "2.0", "id": req.id, "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "hermes-perplexity", "version": "9.9.1"}}}
+            "serverInfo": {"name": "hermes-perplexity", "version": "9.9.2"}}}
     if req.method == "tools/list":
         return {"jsonrpc": "2.0", "id": req.id, "result": {"tools": MCP_TOOL_DEFS}}
     if req.method == "tools/call":
@@ -1074,7 +1242,7 @@ async def status_ep():
         "debug_profile": str(DEBUG_PROFILE), "automation_profile": str(AUTO_PROFILE),
         "last_response_length": len(st.last_resp),
         "memory_count": len(memory),
-        "version": "9.9.1",
+        "version": "9.9.2",
     }
 
 @app.get("/screenshot/latest")
