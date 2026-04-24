@@ -15,17 +15,39 @@ from playwright.async_api import async_playwright, BrowserContext, Page
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("mcp")
 
-BASE_DIR     = Path(__file__).parent.parent
+BASE_DIR      = Path(__file__).parent.parent
 UPLOADS      = BASE_DIR / "uploads"
 DOWNLOADS    = BASE_DIR / "downloads"
 AUTO_PROFILE = BASE_DIR / "chrome-profile"
 DEBUG_PROFILE = Path.home() / "chrome-debug-profile"
-CDP_URL       = "http://localhost:9222"
+MEMORY_FILE  = BASE_DIR / "memory.json"
+CDP_URL      = "http://localhost:9222"
 
 UPLOADS.mkdir(exist_ok=True)
 DOWNLOADS.mkdir(exist_ok=True)
 AUTO_PROFILE.mkdir(exist_ok=True)
 DEBUG_PROFILE.mkdir(exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Memory store — persisted to memory.json
+# ---------------------------------------------------------------------------
+def _load_memory() -> dict:
+    try:
+        if MEMORY_FILE.exists():
+            return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _save_memory(mem: dict):
+    try:
+        MEMORY_FILE.write_text(json.dumps(mem, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        log.warning(f"[MEMORY] Save failed: {e}")
+
+memory: dict = _load_memory()
+
+# ---------------------------------------------------------------------------
 
 def find_chrome_exe() -> str:
     for c in [
@@ -85,7 +107,6 @@ async def broadcast(t: str, d: dict):
 # Stale-page error detection
 # ---------------------------------------------------------------------------
 def _is_closed_error(e: Exception) -> bool:
-    """Return True if the exception indicates the browser page/context was closed."""
     msg = str(e).lower()
     return any(phrase in msg for phrase in [
         "target page, context or browser has been closed",
@@ -150,7 +171,7 @@ async def _try_cdp_connect() -> bool:
         log.info(f"[LAUNCH] CDP connect failed ({e}) — falling back to Playwright launch")
         try:
             if st.pw: await st.pw.stop()
-        except:
+        except Exception:
             pass
         st.pw = st.ctx = st.page = None
         st.cdp_mode = False
@@ -242,7 +263,6 @@ async def _check_login() -> bool:
         if has_auth_cookie:
             log.info("[LOGIN] ✓ Detected via auth cookie")
             return True
-
         has_local_storage = await st.page.evaluate("""() => {
             try {
                 const keys = ['pplx.user', 'user', 'auth', 'session',
@@ -256,7 +276,6 @@ async def _check_login() -> bool:
         if has_local_storage:
             log.info("[LOGIN] ✓ Detected via localStorage")
             return True
-
         logged_in_selectors = [
             'img[alt*="avatar" i]', 'img[alt*="profile" i]', 'img[alt*="user" i]',
             'img[src*="googleusercontent"]', 'img[src*="avatar"]', 'img[src*="profile"]',
@@ -277,7 +296,6 @@ async def _check_login() -> bool:
                     return True
             except Exception:
                 continue
-
         signin_visible = False
         for sel in [
             'a:has-text("Sign in")', 'button:has-text("Sign in")',
@@ -291,11 +309,9 @@ async def _check_login() -> bool:
                     break
             except Exception:
                 continue
-
         if not signin_visible:
             log.info("[LOGIN] ✓ No sign-in button visible — assuming logged in")
             return True
-
         log.info("[LOGIN] ✗ Not logged in")
         return False
     except Exception as e:
@@ -412,8 +428,108 @@ def _format_sources(sources: list[dict]) -> str:
     return '\n'.join(lines)
 
 # ---------------------------------------------------------------------------
+# FIX: Extract ONLY the LAST answer block, not all answers on the page.
+# This prevents response stacking when multiple Q&As exist in one thread.
+# ---------------------------------------------------------------------------
 
+async def _extract_last_answer() -> tuple[str, str]:
+    """
+    Extract only the most recent (last) answer block from the Perplexity page.
+    Returns (answer_text, attribution).
+    """
+    # Try to grab the last answer block specifically
+    last_answer = ""
+
+    # Strategy 1: find all answer/prose blocks and take only the LAST one
+    for sel in [
+        '[data-testid="answer-text"]',
+        'div[class*="prose"]',
+        'div[class*="answer"]',
+        'div[class*="markdown"]',
+        '.markdown-content',
+    ]:
+        try:
+            els = st.page.locator(sel)
+            count = await els.count()
+            if count == 0:
+                continue
+            # Take ONLY the last element (most recent answer)
+            last_el = els.nth(count - 1)
+            text = (await last_el.inner_text()).strip()
+            if len(text) > len(last_answer):
+                last_answer = text
+        except Exception:
+            continue
+
+    # Strategy 2: JS-based — find the last assistant message container
+    if not last_answer:
+        try:
+            last_answer = await st.page.evaluate("""
+            () => {
+                // Try common assistant message wrappers, pick the last one
+                const selectors = [
+                    '[data-testid="answer-text"]',
+                    '[class*="prose"]',
+                    '[class*="answerText"]',
+                    '[class*="AnswerText"]',
+                    '[class*="response"]',
+                ];
+                for (const sel of selectors) {
+                    const els = document.querySelectorAll(sel);
+                    if (els.length > 0) {
+                        return els[els.length - 1].innerText.trim();
+                    }
+                }
+                return '';
+            }
+            """)
+        except Exception:
+            pass
+
+    # Attribution
+    attr = ""
+    for sel in [
+        '[data-testid*="attribution"]', '[class*="attribution"]',
+        '[class*="model-label"]', '[class*="ModelTag"]',
+        'span[class*="source"]', 'div[class*="footer"] span',
+    ]:
+        try:
+            el = st.page.locator(sel).first
+            if await el.count() > 0:
+                txt = (await el.inner_text()).strip()
+                if txt:
+                    attr = txt
+                    break
+        except Exception:
+            continue
+
+    if not attr:
+        try:
+            body = await st.page.evaluate("()=>document.body.innerText")
+            for line in body.splitlines():
+                ls = line.strip()
+                if any(p.lower() in ls.lower() for p in ATTR_PATTERNS) and len(ls) < 120:
+                    attr = ls
+                    break
+        except Exception:
+            pass
+
+    if attr:
+        for m in MODELS:
+            if m.lower() in attr.lower():
+                st.detected_model = m
+                break
+
+    sources = await _extract_sources()
+    last_answer = _clean_answer_text(last_answer)
+    if sources:
+        last_answer = last_answer + _format_sources(sources)
+
+    return last_answer, attr
+
+# Keep _extract() as a full-page fallback for snapshot/baseline purposes only
 async def _extract() -> tuple[str, str]:
+    """Full-page extraction — used only for baseline snapshots before sending."""
     best = ""
     for sel in [
         '[data-testid="answer-text"]', 'div[class*="prose"]', 'div[class*="answer"]',
@@ -430,60 +546,17 @@ async def _extract() -> tuple[str, str]:
                     t = (await els.nth(i).inner_text()).strip()
                     if t:
                         parts.append(t)
-                except:
+                except Exception:
                     continue
             combined = "\n\n".join(parts).strip()
             if len(combined) > len(best):
                 best = combined
-        except:
+        except Exception:
             continue
+    return best, ""
 
-    attr = ""
-    for sel in [
-        '[data-testid*="attribution"]', '[class*="attribution"]',
-        '[class*="model-label"]', '[class*="ModelTag"]',
-        'span[class*="source"]', 'div[class*="footer"] span',
-    ]:
-        try:
-            el = st.page.locator(sel).first
-            if await el.count() > 0:
-                txt = (await el.inner_text()).strip()
-                if txt:
-                    attr = txt
-                    break
-        except:
-            continue
-
-    if not attr:
-        try:
-            body = await st.page.evaluate("()=>document.body.innerText")
-            for line in body.splitlines():
-                ls = line.strip()
-                if any(p.lower() in ls.lower() for p in ATTR_PATTERNS) and len(ls) < 120:
-                    attr = ls
-                    break
-        except:
-            pass
-
-    if attr:
-        for m in MODELS:
-            if m.lower() in attr.lower():
-                st.detected_model = m
-                break
-
-    sources = await _extract_sources()
-    best = _clean_answer_text(best)
-    if sources:
-        best = best + _format_sources(sources)
-
-    return best, attr
-
-# ---------------------------------------------------------------------------
-# FIX: snapshot DOM text BEFORE submitting so _wait_resp can detect
-# genuinely new content instead of re-returning the previous answer.
-# ---------------------------------------------------------------------------
 async def _snapshot_text() -> str:
-    """Grab current page text as a baseline before sending a new message."""
+    """Grab current full-page text as a baseline before sending a new message."""
     try:
         text, _ = await _extract()
         return text
@@ -492,8 +565,8 @@ async def _snapshot_text() -> str:
 
 async def _wait_resp(baseline: str = "", timeout: int = 90) -> tuple[str, str]:
     """
-    Wait for a response that is meaningfully different from `baseline`
-    (the DOM text that existed before the new message was submitted).
+    Wait until the last answer block is stable and different from baseline.
+    Returns only the isolated last answer, not the full page.
     """
     await asyncio.sleep(2)
     deadline = time.time() + timeout
@@ -503,16 +576,22 @@ async def _wait_resp(baseline: str = "", timeout: int = 90) -> tuple[str, str]:
         await asyncio.sleep(1.5)
         sv = False
         try:
-            sv = await st.page.locator('button[aria-label*="Stop" i],button:has-text("Stop")').first.is_visible()
-        except:
+            sv = await st.page.locator(
+                'button[aria-label*="Stop" i],button:has-text("Stop")'
+            ).first.is_visible()
+        except Exception:
             pass
-        text, attr = await _extract()
-        # Skip if text is still the baseline (old answer hasn't changed yet)
-        if baseline and text and text.strip() == baseline.strip():
+
+        # Use full-page text to check if baseline has been replaced
+        full_text, _ = await _extract()
+        if baseline and full_text and full_text.strip() == baseline.strip():
             stable = 0
             prev = ""
             continue
-        # Now check stability of the NEW response
+
+        # Once we know new content is on the page, extract ONLY the last answer
+        text, attr = await _extract_last_answer()
+
         if text and text == prev:
             stable += 1
             if stable >= 3 or (not sv and stable >= 1):
@@ -520,21 +599,19 @@ async def _wait_resp(baseline: str = "", timeout: int = 90) -> tuple[str, str]:
         else:
             stable = 0
             prev = text
-    return await _extract()
+
+    return await _extract_last_answer()
 
 # ---------------------------------------------------------------------------
-# Model switching — robust JS-driven approach
+# Model switching
 # ---------------------------------------------------------------------------
 
 async def _switch_model(model: str) -> dict:
     r: dict = {"success": False, "model": model, "note": ""}
-
     if "perplexity.ai" not in st.page.url:
         await st.page.goto("https://www.perplexity.ai", wait_until="load")
         await asyncio.sleep(2)
-
     target = MODEL_LABEL.get(model)
-
     if not target:
         if "perplexity.ai" not in st.page.url or "/search/" in st.page.url:
             await st.page.goto("https://www.perplexity.ai", wait_until="load")
@@ -543,11 +620,9 @@ async def _switch_model(model: str) -> dict:
         r.update({"success": True, "note": "Navigated to home — Default model active"})
         await broadcast("model_switched", r)
         return r
-
     model_btn_keywords = ["claude", "gpt", "gemini", "sonar", "r1", "default", "model", "pro search"]
     skip_keywords = ["send", "submit", "attach", "upload", "search the web",
                      "sign", "log in", "new chat", "share", "copy", "stop"]
-
     found_btn = await st.page.evaluate("""
     (args) => {
         const { modelBtnKeywords, skipKeywords } = args;
@@ -565,7 +640,6 @@ async def _switch_model(model: str) -> dict:
         return false;
     }
     """, {"modelBtnKeywords": model_btn_keywords, "skipKeywords": skip_keywords})
-
     if found_btn:
         try:
             btn_loc = st.page.locator('[data-mcp-model-btn="true"]').first
@@ -576,13 +650,11 @@ async def _switch_model(model: str) -> dict:
         except Exception as e:
             log.warning(f"[MODEL] Failed clicking model btn: {e}")
             found_btn = False
-
     if not found_btn:
         fn = str(DOWNLOADS / "debug_model_btn.png")
         await st.page.screenshot(path=fn)
         r["note"] = "Model picker button not found — saved debug_model_btn.png"
         return r
-
     option_selectors = [
         f'[role="option"]:has-text("{target}")',
         f'[role="menuitem"]:has-text("{target}")',
@@ -593,7 +665,6 @@ async def _switch_model(model: str) -> dict:
         f'div[class*="option" i]:has-text("{target}")',
         f'div[class*="item" i]:has-text("{target}")',
     ]
-
     clicked = False
     for sel in option_selectors:
         try:
@@ -608,7 +679,6 @@ async def _switch_model(model: str) -> dict:
                 break
         except Exception:
             continue
-
     if not clicked:
         js_clicked = await st.page.evaluate("""
         (targetText) => {
@@ -617,67 +687,69 @@ async def _switch_model(model: str) -> dict:
             );
             for (const el of candidates) {
                 const txt = (el.innerText || el.textContent || '').toLowerCase();
-                if (txt.includes(targetText)) {
-                    el.click();
-                    return true;
-                }
+                if (txt.includes(targetText)) { el.click(); return true; }
             }
             return false;
         }
         """, target)
-
         if js_clicked:
             await asyncio.sleep(1)
             st.current_model = model
             r.update({"success": True, "note": f"✓ Switched to {model} via JS click"})
             log.info(f"[MODEL] ✓ Switched to {model} via JS fallback")
             clicked = True
-
     if not clicked:
         fn = str(DOWNLOADS / "debug_model_picker.png")
         await st.page.screenshot(path=fn)
         await st.page.keyboard.press("Escape")
         r["note"] = f"Picker opened but option '{target}' not found — check debug_model_picker.png"
         log.warning(f"[MODEL] ✗ Could not find option for {model}")
-
     return r
 
 # ---------------------------------------------------------------------------
-# Core send logic — extracted so it can be retried after reconnect
+# Core send logic — retryable
 # ---------------------------------------------------------------------------
 
-async def _do_send(msg: str, attach: str, timeout: int) -> dict:
-    """Type, submit, and wait for a response. Assumes page is alive."""
+async def _do_send(msg: str, attach: str, timeout: int) -> tuple[str, str]:
+    """Type, submit, wait for the isolated last-answer response."""
     baseline = await _snapshot_text()
-
-    # Navigate to home if we're not on perplexity
     if "perplexity.ai" not in st.page.url:
         log.info("[SEND] Not on perplexity.ai — navigating home first")
         await st.page.goto("https://www.perplexity.ai", wait_until="load", timeout=30_000)
         await asyncio.sleep(2)
-
     await _type(msg)
     await _submit()
     await broadcast("tool_progress", {"status": "waiting for response"})
     resp, attr = await _wait_resp(baseline=baseline, timeout=timeout)
     return resp, attr
 
+# ---------------------------------------------------------------------------
+# Tool handlers
+# ---------------------------------------------------------------------------
+
 async def tool_send_message(p: dict) -> dict:
     await _ensure()
     msg = p.get("message", "").strip()
     if not msg:
         return {"error": "message is required"}
+
+    # Auto-inject memory context if any memories exist
+    if memory:
+        mem_lines = [f"- {k}: {v}" for k, v in memory.items()]
+        context_prefix = "[Context from memory]\n" + "\n".join(mem_lines) + "\n\n"
+        msg_with_context = context_prefix + msg
+    else:
+        msg_with_context = msg
+
     attach = st.pending_attach
     st.pending_attach = ""
     await broadcast("tool_start", {"tool": "send_message", "msg": msg[:80], "attach": attach})
     try:
-        resp, attr = await _do_send(msg, attach, p.get("timeout", 90))
+        resp, attr = await _do_send(msg_with_context, attach, p.get("timeout", 90))
     except Exception as e:
         if _is_closed_error(e):
-            # Page died mid-operation — reconnect once and retry
             log.warning(f"[SEND] Stale page detected ({e}) — reconnecting and retrying...")
             await broadcast("browser_reconnecting", {"note": "Page closed mid-send. Reconnecting and retrying..."})
-            # Reset state
             for obj, method in [(st.ctx, "close"), (st.pw, "stop")]:
                 if obj is not None:
                     try:
@@ -689,7 +761,7 @@ async def tool_send_message(p: dict) -> dict:
             st.cdp_mode = False
             await launch_browser()
             try:
-                resp, attr = await _do_send(msg, attach, p.get("timeout", 90))
+                resp, attr = await _do_send(msg_with_context, attach, p.get("timeout", 90))
             except Exception as retry_e:
                 await broadcast("tool_error", {"error": str(retry_e)})
                 return {"error": f"Retry after reconnect also failed: {retry_e}"}
@@ -775,10 +847,7 @@ async def tool_check_login(p: dict) -> dict:
         "⚠ Not logged in. Please sign into Perplexity in the browser window."
     )
     await broadcast("browser_ready", {
-        "logged_in": li,
-        "url": st.page.url,
-        "mode": mode,
-        "note": note,
+        "logged_in": li, "url": st.page.url, "mode": mode, "note": note,
     })
     return {
         "logged_in": li, "mode": mode, "cdp_url": CDP_URL,
@@ -790,6 +859,52 @@ async def tool_check_login(p: dict) -> dict:
         ),
     }
 
+# ---------------------------------------------------------------------------
+# Memory tools
+# ---------------------------------------------------------------------------
+
+async def tool_memory_set(p: dict) -> dict:
+    """
+    Store a key-value fact in persistent memory.
+    Hermes can call this to remember things about the user or session.
+    """
+    key = p.get("key", "").strip()
+    value = p.get("value", "").strip()
+    if not key:
+        return {"error": "key is required"}
+    if value:
+        memory[key] = value
+        log.info(f"[MEMORY] Set: {key!r} = {value!r}")
+    else:
+        memory.pop(key, None)
+        log.info(f"[MEMORY] Deleted: {key!r}")
+    _save_memory(memory)
+    await broadcast("memory_updated", {"key": key, "value": value, "count": len(memory)})
+    return {"success": True, "key": key, "value": value, "total_memories": len(memory)}
+
+async def tool_memory_get(p: dict) -> dict:
+    """Retrieve a specific memory by key, or all memories if no key given."""
+    key = p.get("key", "").strip()
+    if key:
+        val = memory.get(key)
+        if val is None:
+            return {"found": False, "key": key}
+        return {"found": True, "key": key, "value": val}
+    return {"memories": dict(memory), "count": len(memory)}
+
+async def tool_memory_delete(p: dict) -> dict:
+    """Delete a memory entry by key."""
+    key = p.get("key", "").strip()
+    if not key:
+        return {"error": "key is required"}
+    existed = key in memory
+    memory.pop(key, None)
+    _save_memory(memory)
+    await broadcast("memory_updated", {"key": key, "value": None, "count": len(memory)})
+    return {"success": True, "deleted": existed, "key": key, "total_memories": len(memory)}
+
+# ---------------------------------------------------------------------------
+
 TOOLS = {
     "send_message":      tool_send_message,
     "switch_model":      tool_switch_model,
@@ -799,25 +914,61 @@ TOOLS = {
     "new_chat":          tool_new_chat,
     "list_models":       tool_list_models,
     "check_login":       tool_check_login,
+    "memory_set":        tool_memory_set,
+    "memory_get":        tool_memory_get,
+    "memory_delete":     tool_memory_delete,
 }
 
 MCP_TOOL_DEFS = [
-    {"name": "send_message", "description": "Type a message into Perplexity and return the AI response",
-     "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}, "timeout": {"type": "integer", "default": 90}}, "required": ["message"]}},
-    {"name": "switch_model", "description": "Switch the active Perplexity model",
-     "inputSchema": {"type": "object", "properties": {"model": {"type": "string", "enum": MODELS}}, "required": ["model"]}},
-    {"name": "upload_file", "description": "Upload a file from uploads/ folder into the Perplexity chat",
-     "inputSchema": {"type": "object", "properties": {"filename": {"type": "string"}, "original": {"type": "string"}}, "required": ["filename"]}},
-    {"name": "get_last_response", "description": "Retrieve the last response received from Perplexity",
+    {"name": "send_message",
+     "description": "Type a message into Perplexity and return ONLY the latest isolated response. Memory context is automatically prepended if any memories are stored.",
+     "inputSchema": {"type": "object", "properties": {
+         "message": {"type": "string"},
+         "timeout": {"type": "integer", "default": 90}
+     }, "required": ["message"]}},
+    {"name": "switch_model",
+     "description": "Switch the active Perplexity model",
+     "inputSchema": {"type": "object", "properties": {
+         "model": {"type": "string", "enum": MODELS}
+     }, "required": ["model"]}},
+    {"name": "upload_file",
+     "description": "Upload a file from uploads/ folder into the Perplexity chat",
+     "inputSchema": {"type": "object", "properties": {
+         "filename": {"type": "string"}, "original": {"type": "string"}
+     }, "required": ["filename"]}},
+    {"name": "get_last_response",
+     "description": "Retrieve the last response received from Perplexity",
      "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "screenshot", "description": "Take a screenshot of the current browser state",
-     "inputSchema": {"type": "object", "properties": {"full_page": {"type": "boolean", "default": False}}}},
-    {"name": "new_chat", "description": "Navigate to Perplexity home to start a fresh conversation",
+    {"name": "screenshot",
+     "description": "Take a screenshot of the current browser state",
+     "inputSchema": {"type": "object", "properties": {
+         "full_page": {"type": "boolean", "default": False}
+     }}},
+    {"name": "new_chat",
+     "description": "Navigate to Perplexity home to start a fresh conversation",
      "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "list_models", "description": "List all available Perplexity models and the currently active one",
+    {"name": "list_models",
+     "description": "List all available Perplexity models and the currently active one",
      "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "check_login", "description": "Check whether Perplexity is currently logged in and show connection mode",
+    {"name": "check_login",
+     "description": "Check whether Perplexity is currently logged in and show connection mode",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "memory_set",
+     "description": "Store a persistent key-value memory fact. Pass empty value to delete. Memories are auto-injected as context into every send_message call.",
+     "inputSchema": {"type": "object", "properties": {
+         "key": {"type": "string", "description": "Memory key, e.g. 'user_name', 'user_location', 'preferred_language'"},
+         "value": {"type": "string", "description": "Value to store. Pass empty string to delete this key."}
+     }, "required": ["key", "value"]}},
+    {"name": "memory_get",
+     "description": "Retrieve a specific memory by key, or all memories if no key is provided.",
+     "inputSchema": {"type": "object", "properties": {
+         "key": {"type": "string", "description": "Key to look up. Omit to get all memories."}
+     }}},
+    {"name": "memory_delete",
+     "description": "Delete a memory entry by key.",
+     "inputSchema": {"type": "object", "properties": {
+         "key": {"type": "string"}
+     }, "required": ["key"]}},
 ]
 
 @asynccontextmanager
@@ -831,19 +982,19 @@ async def lifespan(app: FastAPI):
     if not task.done(): task.cancel()
     if st.ctx and not st.cdp_mode:
         try: await st.ctx.close()
-        except: pass
+        except Exception: pass
     if st.pw:
         try: await st.pw.stop()
-        except: pass
+        except Exception: pass
 
-app = FastAPI(title="Hermes-Perplexity MCP", version="9.8.0", lifespan=lifespan)
+app = FastAPI(title="Hermes-Perplexity MCP", version="9.9.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/sse")
 async def sse_ep(request: Request):
     q: asyncio.Queue = asyncio.Queue()
     clients.append(q)
-    await q.put(json.dumps({"type": "mcp_init", "version": "9.8.0", "tools": MCP_TOOL_DEFS, "models": MODELS}))
+    await q.put(json.dumps({"type": "mcp_init", "version": "9.9.0", "tools": MCP_TOOL_DEFS, "models": MODELS}))
     async def gen():
         try:
             while True:
@@ -868,7 +1019,7 @@ async def mcp_ep(req: MCPReq):
         return {"jsonrpc": "2.0", "id": req.id, "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "hermes-perplexity", "version": "9.8.0"}}}
+            "serverInfo": {"name": "hermes-perplexity", "version": "9.9.0"}}}
     if req.method == "tools/list":
         return {"jsonrpc": "2.0", "id": req.id, "result": {"tools": MCP_TOOL_DEFS}}
     if req.method == "tools/call":
@@ -903,6 +1054,10 @@ async def dls_ep():
         key=lambda x: -x["modified"])
     return {"files": files}
 
+@app.get("/memory")
+async def memory_ep():
+    return {"memories": dict(memory), "count": len(memory)}
+
 @app.get("/status")
 async def status_ep():
     return {
@@ -912,7 +1067,9 @@ async def status_ep():
         "detected_model": st.detected_model, "sse_clients": len(clients),
         "chrome_exe": CHROME_EXE or "playwright bundled chromium",
         "debug_profile": str(DEBUG_PROFILE), "automation_profile": str(AUTO_PROFILE),
-        "last_response_length": len(st.last_resp), "version": "9.8.0",
+        "last_response_length": len(st.last_resp),
+        "memory_count": len(memory),
+        "version": "9.9.0",
     }
 
 @app.get("/screenshot/latest")
