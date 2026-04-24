@@ -50,13 +50,20 @@ background:var(--bg);border-radius:6px;font-size:12px}
 .file-item a{color:var(--primary);text-decoration:none;font-size:11px}
 .chat-area{display:flex;flex-direction:column;overflow:hidden}
 .messages{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
-.msg{max-width:78%;padding:10px 14px;border-radius:var(--radius-lg);font-size:13px;line-height:1.6}
+.msg{max-width:78%;padding:10px 14px;border-radius:var(--radius-lg);font-size:13px;line-height:1.6;position:relative}
 .msg.user{background:var(--primary);color:#fff;align-self:flex-end;border-bottom-right-radius:4px}
 .msg.ai{background:var(--surface2);border:1px solid var(--border);align-self:flex-start;border-bottom-left-radius:4px}
 .msg.system{background:transparent;border:1px solid var(--border);
 color:var(--muted);align-self:center;font-size:12px;max-width:90%;text-align:center}
 .msg.thinking{background:var(--surface2);border:1px dashed var(--border);
 align-self:flex-start;border-bottom-left-radius:4px;color:var(--muted);font-style:italic}
+/* Role labels */
+.msg-role{font-size:10px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;margin-bottom:4px;display:block}
+.msg.user .msg-role{color:rgba(255,255,255,.75)}
+.msg.ai .msg-role{color:var(--primary)}
+/* Timestamp */
+.msg-time{font-size:10px;color:rgba(255,255,255,.4);margin-top:6px;display:block;text-align:right}
+.msg.ai .msg-time{color:var(--muted)}
 .msg .model-tag{font-size:11px;opacity:.6;margin-top:6px;padding-top:6px;
 border-top:1px solid rgba(255,255,255,.08)}
 .msg .attach-badge{display:inline-flex;align-items:center;gap:5px;
@@ -97,7 +104,7 @@ input[type=file]{display:none}
     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
       <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
     </svg>
-    <h1>Hermes ↔ Perplexity MCP <span style="color:var(--muted);font-weight:400">v9</span></h1>
+    <h1>Hermes ↔ Perplexity MCP <span style="color:var(--muted);font-weight:400">v9.7</span></h1>
     <div class="status-dot" id="dot"></div>
     <span class="status-label" id="statusLabel">Connecting…</span>
   </header>
@@ -122,7 +129,7 @@ input[type=file]{display:none}
         <div class="section-title">Upload File → Perplexity</div>
         <div class="card" style="gap:8px;display:flex;flex-direction:column">
           <div class="upload-area" id="uploadArea" onclick="document.getElementById('fu').click()">
-            📎 Click to attach file
+            📎 Click to select file
           </div>
           <input type="file" id="fu" onchange="onFileChosen(this)">
           <div class="file-list" id="uploadList"></div>
@@ -172,16 +179,36 @@ function logLine(msg){
   el.textContent=new Date().toLocaleTimeString()+' '+msg;
 }
 
+function nowTime(){
+  return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+}
+
 function addMsg(role, text, model, attachName){
   const c=document.getElementById('msgs');
   const d=document.createElement('div');
   d.className='msg '+role;
   let html='';
+
+  // Role label for user and ai messages
+  if(role==='user'){
+    html+=`<span class="msg-role">Admin</span>`;
+  } else if(role==='ai'){
+    html+=`<span class="msg-role">Agent</span>`;
+  }
+
   if(attachName){
     html+=`<div class="attach-badge">📎 ${escHtml(attachName)}</div><br>`;
   }
+
   html+=escHtml(text).replace(/\n/g,'<br>');
+
   if(model) html+=`<div class="model-tag">Model: ${escHtml(model)}</div>`;
+
+  // Timestamp for user and ai messages
+  if(role==='user'||role==='ai'){
+    html+=`<span class="msg-time">${nowTime()}</span>`;
+  }
+
   d.innerHTML=html;
   c.appendChild(d);
   c.scrollTop=c.scrollHeight;
@@ -206,7 +233,6 @@ function removeThinking(){
   if(thinkingEl){thinkingEl.remove();thinkingEl=null;}
 }
 
-// Set status dot: 'ready' | 'warn' | 'error' | ''
 function setStatus(state, label){
   document.getElementById('dot').className='status-dot'+(state?' '+state:'');
   document.getElementById('statusLabel').textContent=label;
@@ -221,7 +247,6 @@ function connectSSE(){
   };
 }
 
-// Track last reconnect message so we update it in-place instead of appending
 let reconnectMsgEl=null;
 
 function handleEvent(ev){
@@ -231,16 +256,15 @@ function handleEvent(ev){
   switch(ev.type){
     case 'mcp_init':
     case 'ping':
-      break; // silent
+      break;
 
     case 'browser_ready':
-      reconnectMsgEl=null; // reset so next reconnect gets a fresh line
+      reconnectMsgEl=null;
       setStatus(d.logged_in?'ready':'warn', d.logged_in?'✓ Ready & Logged In':'⚠ Ready – Please Sign In');
       addMsg('system', d.note||'Browser ready');
       break;
 
     case 'browser_reconnecting':
-      // Update in-place rather than flooding chat with banners
       if(reconnectMsgEl){
         reconnectMsgEl.textContent='🔄 Reconnecting…';
       } else {
@@ -260,7 +284,6 @@ function handleEvent(ev){
       break;
 
     case 'tool_progress':
-      // already showing thinking indicator — nothing extra needed
       break;
 
     case 'tool_error':
@@ -294,13 +317,11 @@ function handleEvent(ev){
       break;
 
     case 'file_uploaded':{
-      // Server confirmed upload — send it to Perplexity browser automatically
       const li=document.getElementById('uploadList');
       const it=document.createElement('div');
       it.className='file-item';
       it.innerHTML=`<span title="${escHtml(d.filename)}">${escHtml(d.original)}</span><span style="color:var(--success)">✓</span>`;
       li.prepend(it);
-      // Trigger the upload_file tool so Perplexity receives it
       fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({jsonrpc:'2.0',id:99,method:'tools/call',
           params:{name:'upload_file',arguments:{filename:d.filename}}})});
@@ -312,24 +333,20 @@ function handleEvent(ev){
   }
 }
 
-// ── File attachment UI ──────────────────────────────────────────────────────
 function onFileChosen(inp){
   const f=inp.files[0];
   if(!f) return;
-  // Stage the file locally first
   pendingFile=f;
   document.getElementById('attachName').textContent=f.name;
   document.getElementById('attachPreview').classList.add('show');
-  // Mark upload area
   const ua=document.getElementById('uploadArea');
   ua.classList.add('has-file');
   ua.textContent='✓ '+f.name;
-  // Upload to server staging area immediately
   const fd=new FormData();
   fd.append('file',f);
-  fetch(BASE+'/upload',{method:'POST',body:fd})  // SSE file_uploaded triggers tool call
+  fetch(BASE+'/upload',{method:'POST',body:fd})
     .catch(e=>addMsg('system','❌ Upload failed: '+e));
-  inp.value=''; // allow re-selecting same file
+  inp.value='';
 }
 
 function clearAttach(){
@@ -338,10 +355,9 @@ function clearAttach(){
   document.getElementById('attachName').textContent='';
   const ua=document.getElementById('uploadArea');
   ua.classList.remove('has-file');
-  ua.textContent='📎 Click to attach file';
+  ua.textContent='📎 Click to select file';
 }
 
-// ── Send message ────────────────────────────────────────────────────────────
 async function send(){
   const inp=document.getElementById('inp'), msg=inp.value.trim();
   if(!msg||sending) return;
@@ -366,7 +382,6 @@ async function send(){
   }
 }
 
-// ── Sidebar actions ─────────────────────────────────────────────────────────
 async function switchModel(m){
   document.getElementById('modelStatus').textContent='Switching…';
   await fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
