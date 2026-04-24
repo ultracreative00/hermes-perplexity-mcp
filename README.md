@@ -1,5 +1,3 @@
-# Hello World
-
 # Hermes ↔ Perplexity MCP Bridge v9
 
 > **Control Perplexity AI via your real browser — no API key required. No Perplexity API is used or permitted.**
