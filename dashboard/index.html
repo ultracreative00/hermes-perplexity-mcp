@@ -18,6 +18,7 @@ header svg{color:var(--primary);flex-shrink:0}
 header h1{font-size:16px;font-weight:600;flex:1}
 .status-dot{width:8px;height:8px;border-radius:50%;background:var(--faint);transition:.3s}
 .status-dot.ready{background:var(--success)}
+.status-dot.warn{background:var(--warn)}
 .status-dot.error{background:var(--error)}
 .status-label{font-size:12px;color:var(--muted)}
 main{display:grid;grid-template-columns:300px 1fr;overflow:hidden}
@@ -39,8 +40,9 @@ font-weight:500;cursor:pointer;border:none;transition:.18s;width:100%}
 .btn-secondary{background:var(--surface);border:1px solid var(--border);color:var(--text)}
 .btn-secondary:hover{background:var(--surface2)}
 .upload-area{border:2px dashed var(--border);border-radius:var(--radius);
-padding:20px;text-align:center;cursor:pointer;transition:.18s;color:var(--muted)}
+padding:16px;text-align:center;cursor:pointer;transition:.18s;color:var(--muted);font-size:12px}
 .upload-area:hover{border-color:var(--primary);color:var(--primary)}
+.upload-area.has-file{border-color:var(--success);color:var(--success);background:rgba(109,170,69,.08)}
 .file-list{display:flex;flex-direction:column;gap:4px;max-height:160px;overflow-y:auto}
 .file-item{display:flex;align-items:center;gap:8px;padding:6px 8px;
 background:var(--bg);border-radius:6px;font-size:12px}
@@ -48,28 +50,43 @@ background:var(--bg);border-radius:6px;font-size:12px}
 .file-item a{color:var(--primary);text-decoration:none;font-size:11px}
 .chat-area{display:flex;flex-direction:column;overflow:hidden}
 .messages{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
-.msg{max-width:75%;padding:10px 14px;border-radius:var(--radius-lg);font-size:13px;line-height:1.6}
+.msg{max-width:78%;padding:10px 14px;border-radius:var(--radius-lg);font-size:13px;line-height:1.6}
 .msg.user{background:var(--primary);color:#fff;align-self:flex-end;border-bottom-right-radius:4px}
 .msg.ai{background:var(--surface2);border:1px solid var(--border);align-self:flex-start;border-bottom-left-radius:4px}
 .msg.system{background:transparent;border:1px solid var(--border);
-color:var(--muted);align-self:center;font-size:12px;max-width:90%}
-.msg .model-tag{font-size:11px;opacity:.7;margin-top:4px}
-.input-row{padding:16px;border-top:1px solid var(--border);
+color:var(--muted);align-self:center;font-size:12px;max-width:90%;text-align:center}
+.msg.thinking{background:var(--surface2);border:1px dashed var(--border);
+align-self:flex-start;border-bottom-left-radius:4px;color:var(--muted);font-style:italic}
+.msg .model-tag{font-size:11px;opacity:.6;margin-top:6px;padding-top:6px;
+border-top:1px solid rgba(255,255,255,.08)}
+.msg .attach-badge{display:inline-flex;align-items:center;gap:5px;
+background:rgba(255,255,255,.12);border-radius:4px;padding:3px 7px;
+font-size:11px;margin-bottom:6px}
+.input-row{padding:12px 16px;border-top:1px solid var(--border);
 background:var(--surface);display:flex;gap:8px;align-items:flex-end}
-.input-row textarea{flex:1;padding:10px 14px;background:var(--bg);
+.input-col{flex:1;display:flex;flex-direction:column;gap:6px}
+.attach-preview{display:none;align-items:center;gap:6px;padding:5px 10px;
+background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);
+font-size:12px;color:var(--text)}
+.attach-preview.show{display:flex}
+.attach-preview .remove{cursor:pointer;color:var(--muted);margin-left:auto;font-size:14px;line-height:1}
+.attach-preview .remove:hover{color:var(--error)}
+.input-row textarea{width:100%;padding:10px 14px;background:var(--bg);
 border:1px solid var(--border);border-radius:var(--radius-lg);
 color:var(--text);font-size:13px;resize:none;min-height:42px;max-height:120px;
 font-family:inherit;line-height:1.5}
 .input-row textarea:focus{outline:2px solid var(--primary);outline-offset:2px}
 .send-btn{padding:10px 18px;background:var(--primary);color:#fff;
 border:none;border-radius:var(--radius-lg);cursor:pointer;
-font-size:13px;font-weight:500;transition:.18s;white-space:nowrap}
+font-size:13px;font-weight:500;transition:.18s;white-space:nowrap;align-self:flex-end}
 .send-btn:hover{background:var(--primary-h)}
 .send-btn:disabled{opacity:.5;cursor:not-allowed}
 .log-area{font-size:11px;color:var(--muted);background:var(--bg);
-padding:8px 12px;border-top:1px solid var(--border);max-height:90px;
-overflow-y:auto;font-family:monospace}
+padding:6px 12px;border-top:1px solid var(--border);height:32px;
+overflow:hidden;font-family:monospace;white-space:nowrap;text-overflow:ellipsis}
 input[type=file]{display:none}
+@keyframes blink{0%,100%{opacity:.3}50%{opacity:1}}
+.dot-blink{animation:blink 1.2s ease-in-out infinite}
 </style>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
@@ -104,10 +121,10 @@ input[type=file]{display:none}
       <div>
         <div class="section-title">Upload File → Perplexity</div>
         <div class="card" style="gap:8px;display:flex;flex-direction:column">
-          <div class="upload-area" onclick="document.getElementById('fu').click()">
-            Click to select file
+          <div class="upload-area" id="uploadArea" onclick="document.getElementById('fu').click()">
+            📎 Click to attach file
           </div>
-          <input type="file" id="fu" onchange="uploadFile(this)">
+          <input type="file" id="fu" onchange="onFileChosen(this)">
           <div class="file-list" id="uploadList"></div>
         </div>
       </div>
@@ -133,8 +150,14 @@ input[type=file]{display:none}
       </div>
       <div class="log-area" id="log">Waiting for events…</div>
       <div class="input-row">
-        <textarea id="inp" rows="1" placeholder="Send message to Perplexity…"
-          onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea>
+        <div class="input-col">
+          <div class="attach-preview" id="attachPreview">
+            <span id="attachName"></span>
+            <span class="remove" onclick="clearAttach()" title="Remove">×</span>
+          </div>
+          <textarea id="inp" rows="1" placeholder="Send message to Perplexity…"
+            onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea>
+        </div>
         <button class="send-btn" id="sendBtn" onclick="send()">Send</button>
       </div>
     </section>
@@ -142,101 +165,245 @@ input[type=file]{display:none}
 </div>
 <script>
 const BASE='';
-let es,sending=false;
-function log(msg){const el=document.getElementById('log');el.textContent=new Date().toLocaleTimeString()+' '+msg;}
-function addMsg(role,text,model){
+let es, sending=false, pendingFile=null, thinkingEl=null;
+
+function logLine(msg){
+  const el=document.getElementById('log');
+  el.textContent=new Date().toLocaleTimeString()+' '+msg;
+}
+
+function addMsg(role, text, model, attachName){
   const c=document.getElementById('msgs');
   const d=document.createElement('div');
   d.className='msg '+role;
-  d.innerHTML=text.replace(/</g,'&lt;').replace(/\n/g,'<br>')+(model?`<div class="model-tag">Model: ${model}</div>`:'');
-  c.appendChild(d);c.scrollTop=c.scrollHeight;
+  let html='';
+  if(attachName){
+    html+=`<div class="attach-badge">📎 ${escHtml(attachName)}</div><br>`;
+  }
+  html+=escHtml(text).replace(/\n/g,'<br>');
+  if(model) html+=`<div class="model-tag">Model: ${escHtml(model)}</div>`;
+  d.innerHTML=html;
+  c.appendChild(d);
+  c.scrollTop=c.scrollHeight;
+  return d;
 }
+
+function escHtml(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function showThinking(){
+  removeThinking();
+  const c=document.getElementById('msgs');
+  thinkingEl=document.createElement('div');
+  thinkingEl.className='msg thinking';
+  thinkingEl.innerHTML='<span class="dot-blink">●●●</span>&nbsp; Thinking…';
+  c.appendChild(thinkingEl);
+  c.scrollTop=c.scrollHeight;
+}
+
+function removeThinking(){
+  if(thinkingEl){thinkingEl.remove();thinkingEl=null;}
+}
+
+// Set status dot: 'ready' | 'warn' | 'error' | ''
+function setStatus(state, label){
+  document.getElementById('dot').className='status-dot'+(state?' '+state:'');
+  document.getElementById('statusLabel').textContent=label;
+}
+
 function connectSSE(){
   es=new EventSource(BASE+'/sse');
-  es.onmessage=e=>{try{handleEvent(JSON.parse(e.data));}catch{}};
-  es.onerror=()=>{document.getElementById('dot').className='status-dot error';
-    document.getElementById('statusLabel').textContent='Disconnected – retrying…';
-    setTimeout(connectSSE,3000);};
+  es.onmessage=e=>{try{handleEvent(JSON.parse(e.data));}catch(err){logLine('parse error: '+err);}};
+  es.onerror=()=>{
+    setStatus('error','Disconnected – retrying…');
+    setTimeout(connectSSE,3000);
+  };
 }
-function handleEvent(d){
-  log(JSON.stringify(d).slice(0,120));
-  if(d.type==='browser_ready'){
-    document.getElementById('dot').className='status-dot ready';
-    document.getElementById('statusLabel').textContent=d.data.logged_in?'✓ Ready & Logged In':'⚠ Ready – Please Sign In';
-    addMsg('system',d.data.note||'Browser ready');
-  }else if(d.type==='browser_reconnecting'){
-    document.getElementById('dot').className='status-dot error';
-    document.getElementById('statusLabel').textContent='Reconnecting…';
-    addMsg('system','🔄 '+d.data.note);
-  }else if(d.type==='browser_error'){
-    document.getElementById('dot').className='status-dot error';
-    addMsg('system','❌ '+d.data.error);
-  }else if(d.type==='response_ready'){
-    sending=false;document.getElementById('sendBtn').disabled=false;
-    // FIX: use full response text when available, fall back to preview
-    const text = d.data.full || d.data.preview || '';
-    addMsg('ai', text, d.data.model);
-    refreshDL();
-  }else if(d.type==='model_switched'){
-    const sel=document.getElementById('modelSel');
-    if(d.data.model){for(let o of sel.options){if(o.value===d.data.model){sel.value=d.data.model;break;}}}
-    document.getElementById('modelStatus').textContent=d.data.success
-      ? '✓ '+d.data.note
-      : '⚠ '+d.data.note;
-  }else if(d.type==='tool_start'){
-    addMsg('user',d.data.msg||'');
-  }else if(d.type==='screenshot_ready'){
-    addMsg('system','📷 Screenshot saved: '+d.data.file);refreshDL();
-  }else if(d.type==='new_chat'){
-    addMsg('system','✓ New chat started');
-  }else if(d.type==='file_uploaded'){
-    const li=document.getElementById('uploadList');
-    const it=document.createElement('div');it.className='file-item';
-    it.innerHTML=`<span>${d.data.original}</span><span style="color:var(--success)">✓</span>`;
-    li.prepend(it);
+
+// Track last reconnect message so we update it in-place instead of appending
+let reconnectMsgEl=null;
+
+function handleEvent(ev){
+  const d=ev.data||{};
+  logLine(ev.type+' '+JSON.stringify(d).slice(0,80));
+
+  switch(ev.type){
+    case 'mcp_init':
+    case 'ping':
+      break; // silent
+
+    case 'browser_ready':
+      reconnectMsgEl=null; // reset so next reconnect gets a fresh line
+      setStatus(d.logged_in?'ready':'warn', d.logged_in?'✓ Ready & Logged In':'⚠ Ready – Please Sign In');
+      addMsg('system', d.note||'Browser ready');
+      break;
+
+    case 'browser_reconnecting':
+      // Update in-place rather than flooding chat with banners
+      if(reconnectMsgEl){
+        reconnectMsgEl.textContent='🔄 Reconnecting…';
+      } else {
+        reconnectMsgEl=addMsg('system','🔄 Reconnecting…');
+      }
+      setStatus('error','Reconnecting…');
+      break;
+
+    case 'browser_error':
+      setStatus('error','Browser error');
+      addMsg('system','❌ '+d.error);
+      break;
+
+    case 'tool_start':
+      addMsg('user', d.msg||'', null, d.attach||null);
+      showThinking();
+      break;
+
+    case 'tool_progress':
+      // already showing thinking indicator — nothing extra needed
+      break;
+
+    case 'tool_error':
+      removeThinking();
+      sending=false;
+      document.getElementById('sendBtn').disabled=false;
+      addMsg('system','❌ Error: '+(d.error||'unknown'));
+      break;
+
+    case 'response_ready':
+      removeThinking();
+      sending=false;
+      document.getElementById('sendBtn').disabled=false;
+      addMsg('ai', d.full||d.preview||'', d.model);
+      refreshDL();
+      break;
+
+    case 'model_switched':{
+      const sel=document.getElementById('modelSel');
+      if(d.model){for(const o of sel.options){if(o.value===d.model){sel.value=d.model;break;}}}
+      document.getElementById('modelStatus').textContent=d.success?'✓ '+d.note:'⚠ '+d.note;
+      break;
+    }
+    case 'screenshot_ready':
+      addMsg('system','📷 Screenshot: '+d.file);
+      refreshDL();
+      break;
+
+    case 'new_chat':
+      addMsg('system','✓ New chat started');
+      break;
+
+    case 'file_uploaded':{
+      // Server confirmed upload — send it to Perplexity browser automatically
+      const li=document.getElementById('uploadList');
+      const it=document.createElement('div');
+      it.className='file-item';
+      it.innerHTML=`<span title="${escHtml(d.filename)}">${escHtml(d.original)}</span><span style="color:var(--success)">✓</span>`;
+      li.prepend(it);
+      // Trigger the upload_file tool so Perplexity receives it
+      fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({jsonrpc:'2.0',id:99,method:'tools/call',
+          params:{name:'upload_file',arguments:{filename:d.filename}}})});
+      break;
+    }
+    case 'file_sent_to_browser':
+      addMsg('system','📎 Attached to Perplexity: '+d.file);
+      break;
   }
 }
-async function send(){
-  const inp=document.getElementById('inp'),msg=inp.value.trim();
-  if(!msg||sending)return;
-  sending=true;document.getElementById('sendBtn').disabled=true;inp.value='';
-  const res=await fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'send_message',arguments:{message:msg}}})});
-  const j=await res.json();
-  if(j.error){sending=false;document.getElementById('sendBtn').disabled=false;addMsg('system','❌ '+j.error.message);}
+
+// ── File attachment UI ──────────────────────────────────────────────────────
+function onFileChosen(inp){
+  const f=inp.files[0];
+  if(!f) return;
+  // Stage the file locally first
+  pendingFile=f;
+  document.getElementById('attachName').textContent=f.name;
+  document.getElementById('attachPreview').classList.add('show');
+  // Mark upload area
+  const ua=document.getElementById('uploadArea');
+  ua.classList.add('has-file');
+  ua.textContent='✓ '+f.name;
+  // Upload to server staging area immediately
+  const fd=new FormData();
+  fd.append('file',f);
+  fetch(BASE+'/upload',{method:'POST',body:fd})  // SSE file_uploaded triggers tool call
+    .catch(e=>addMsg('system','❌ Upload failed: '+e));
+  inp.value=''; // allow re-selecting same file
 }
+
+function clearAttach(){
+  pendingFile=null;
+  document.getElementById('attachPreview').classList.remove('show');
+  document.getElementById('attachName').textContent='';
+  const ua=document.getElementById('uploadArea');
+  ua.classList.remove('has-file');
+  ua.textContent='📎 Click to attach file';
+}
+
+// ── Send message ────────────────────────────────────────────────────────────
+async function send(){
+  const inp=document.getElementById('inp'), msg=inp.value.trim();
+  if(!msg||sending) return;
+  sending=true;
+  document.getElementById('sendBtn').disabled=true;
+  inp.value='';
+  const attachLabel=pendingFile?pendingFile.name:null;
+  clearAttach();
+  const res=await fetch(BASE+'/mcp',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',
+      params:{name:'send_message',arguments:{message:msg}}})
+  }).catch(e=>{addMsg('system','❌ Fetch error: '+e);sending=false;document.getElementById('sendBtn').disabled=false;return null;});
+  if(!res) return;
+  const j=await res.json().catch(()=>null);
+  if(j&&j.error){
+    sending=false;
+    document.getElementById('sendBtn').disabled=false;
+    removeThinking();
+    addMsg('system','❌ '+j.error.message);
+  }
+}
+
+// ── Sidebar actions ─────────────────────────────────────────────────────────
 async function switchModel(m){
   document.getElementById('modelStatus').textContent='Switching…';
   await fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'switch_model',arguments:{model:m}}})});
 }
-async function uploadFile(inp){
-  const f=inp.files[0];if(!f)return;
-  const fd=new FormData();fd.append('file',f);
-  const r=await fetch(BASE+'/upload',{method:'POST',body:fd});
-  const j=await r.json();
-  await fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({jsonrpc:'2.0',id:3,method:'tools/call',params:{name:'upload_file',arguments:{filename:j.filename}}})});
-}
+
 async function refreshDL(){
-  const r=await fetch(BASE+'/downloads');const j=await r.json();
+  const r=await fetch(BASE+'/downloads').catch(()=>null);
+  if(!r) return;
+  const j=await r.json().catch(()=>({files:[]}));
   document.getElementById('dlList').innerHTML=j.files.slice(0,10).map(f=>
-    `<div class="file-item"><span>${f.name}</span><a href="/download/${f.name}" download>↓</a></div>`).join('');
+    `<div class="file-item"><span title="${escHtml(f.name)}">${escHtml(f.name)}</span><a href="/download/${encodeURIComponent(f.name)}" download>↓</a></div>`
+  ).join('');
 }
+
 async function newChat(){
+  clearAttach();
   await fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({jsonrpc:'2.0',id:4,method:'tools/call',params:{name:'new_chat',arguments:{}}})});}
+
 async function takeShot(){
   await fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({jsonrpc:'2.0',id:5,method:'tools/call',params:{name:'screenshot',arguments:{}}})});}
+
 async function checkLogin(){
   const r=await fetch(BASE+'/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({jsonrpc:'2.0',id:6,method:'tools/call',params:{name:'check_login',arguments:{}}})});
-  const j=await r.json();
-  try{const d=JSON.parse(j.result.content[0].text);
-    addMsg('system',`Login: ${d.logged_in?'✓ Logged in':'⚠ Not logged in'} | Mode: ${d.mode}`);}catch{}
+  const j=await r.json().catch(()=>null);
+  try{
+    const d=JSON.parse(j.result.content[0].text);
+    setStatus(d.logged_in?'ready':'warn', d.logged_in?'✓ Ready & Logged In':'⚠ Ready – Please Sign In');
+    addMsg('system',`Login: ${d.logged_in?'✓ Logged in':'⚠ Not logged in'} | Mode: ${d.mode}`);
+  }catch{}
 }
-connectSSE();refreshDL();
+
+connectSSE();
+refreshDL();
 </script>
 </body>
 </html>
