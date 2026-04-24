@@ -1,4 +1,4 @@
-import asyncio, json, logging, os, time, uuid, traceback
+import asyncio, json, logging, os, re, time, uuid, traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -51,9 +51,13 @@ MODELS = [
     "Gemini 2.0 Flash", "Sonar Pro", "Sonar", "R1 1776",
 ]
 MODEL_LABEL = {
-    "Default": None, "Claude Sonnet 4.5": "Claude", "GPT-4o": "GPT-4o",
-    "Gemini 2.0 Flash": "Gemini", "Sonar Pro": "Sonar Pro",
-    "Sonar": "Sonar", "R1 1776": "R1",
+    "Default": None,
+    "Claude Sonnet 4.5": "claude",
+    "GPT-4o": "gpt",
+    "Gemini 2.0 Flash": "gemini",
+    "Sonar Pro": "sonar pro",
+    "Sonar": "sonar",
+    "R1 1776": "r1",
 }
 
 class State:
@@ -67,7 +71,7 @@ class State:
     ready = False
     logged_in = False
     cdp_mode = False
-    pending_attach: str = ""   # original filename of last uploaded file
+    pending_attach: str = ""
 
 st = State()
 clients: list[asyncio.Queue] = []
@@ -100,10 +104,8 @@ async def _ensure_page_alive():
                 await getattr(obj, method)()
             except Exception:
                 pass
-    st.pw      = None
-    st.ctx     = None
-    st.page    = None
-    st.ready   = False
+    st.pw = st.ctx = st.page = None
+    st.ready = False
     st.cdp_mode = False
     await launch_browser()
 
@@ -214,17 +216,7 @@ async def launch_browser():
         await broadcast("browser_error", {"error": str(e), "traceback": traceback.format_exc()})
 
 async def _check_login() -> bool:
-    """
-    Robust login detection for Perplexity.ai.
-    Strategy (in order of reliability):
-      1. JS cookie scan — pplx_auth, __session, next-auth.session-token, pplx_user
-      2. JS localStorage scan — pplx.user, user, auth, session
-      3. Wide DOM selector scan — avatars, account menus, profile links
-      4. Absence of Sign-in button (last resort)
-    Returns True if any signal confirms a logged-in session.
-    """
     try:
-        # 1. Cookie-based check (most reliable)
         has_auth_cookie = await st.page.evaluate("""() => {
             const cookieStr = document.cookie;
             const authKeys = ['pplx_auth', '__session', 'next-auth.session-token',
@@ -236,7 +228,6 @@ async def _check_login() -> bool:
             log.info("[LOGIN] ✓ Detected via auth cookie")
             return True
 
-        # 2. localStorage-based check
         has_local_storage = await st.page.evaluate("""() => {
             try {
                 const keys = ['pplx.user', 'user', 'auth', 'session',
@@ -251,51 +242,27 @@ async def _check_login() -> bool:
             log.info("[LOGIN] ✓ Detected via localStorage")
             return True
 
-        # 3. Wide DOM selector scan
         logged_in_selectors = [
-            # Avatar / profile images
-            'img[alt*="avatar" i]',
-            'img[alt*="profile" i]',
-            'img[alt*="user" i]',
-            'img[src*="googleusercontent"]',
-            'img[src*="avatar"]',
-            'img[src*="profile"]',
-            # Account / user UI elements
-            'button[aria-label*="account" i]',
-            'button[aria-label*="user" i]',
-            'button[aria-label*="profile" i]',
-            'button[aria-label*="menu" i]',
-            '[data-testid*="user" i]',
-            '[data-testid*="avatar" i]',
-            '[data-testid*="account" i]',
-            '[data-testid*="profile" i]',
-            # Settings / account links
-            'a[href*="/settings"]',
-            'a[href*="/account"]',
-            'a[href*="/profile"]',
-            # Class-based (common React patterns)
-            'div[class*="UserAvatar"]',
-            'div[class*="userAvatar"]',
-            'div[class*="Avatar"]',
-            'div[class*="ProfilePic"]',
-            'div[class*="accountMenu"]',
-            'div[class*="userMenu"]',
-            # Perplexity-specific patterns
-            '[class*="UserCircle"]',
-            '[class*="userCircle"]',
-            'button[class*="account"]',
-            'span[class*="username"]',
+            'img[alt*="avatar" i]', 'img[alt*="profile" i]', 'img[alt*="user" i]',
+            'img[src*="googleusercontent"]', 'img[src*="avatar"]', 'img[src*="profile"]',
+            'button[aria-label*="account" i]', 'button[aria-label*="user" i]',
+            'button[aria-label*="profile" i]', 'button[aria-label*="menu" i]',
+            '[data-testid*="user" i]', '[data-testid*="avatar" i]',
+            '[data-testid*="account" i]', '[data-testid*="profile" i]',
+            'a[href*="/settings"]', 'a[href*="/account"]', 'a[href*="/profile"]',
+            'div[class*="UserAvatar"]', 'div[class*="userAvatar"]', 'div[class*="Avatar"]',
+            'div[class*="ProfilePic"]', 'div[class*="accountMenu"]', 'div[class*="userMenu"]',
+            '[class*="UserCircle"]', '[class*="userCircle"]',
+            'button[class*="account"]', 'span[class*="username"]',
         ]
         for sel in logged_in_selectors:
             try:
-                loc = st.page.locator(sel).first
-                if await loc.count() > 0:
+                if await st.page.locator(sel).first.count() > 0:
                     log.info(f"[LOGIN] ✓ Detected via DOM selector: {sel}")
                     return True
             except Exception:
                 continue
 
-        # 4. Absence of Sign-in button (last resort — weakest signal)
         signin_visible = False
         for sel in [
             'a:has-text("Sign in")', 'button:has-text("Sign in")',
@@ -310,14 +277,12 @@ async def _check_login() -> bool:
             except Exception:
                 continue
 
-        # If no sign-in button found, assume logged in
         if not signin_visible:
             log.info("[LOGIN] ✓ No sign-in button visible — assuming logged in")
             return True
 
-        log.info("[LOGIN] ✗ Not logged in — sign-in button found and no auth signals detected")
+        log.info("[LOGIN] ✗ Not logged in")
         return False
-
     except Exception as e:
         log.warning(f"[LOGIN] check error: {e}")
         return False
@@ -351,6 +316,115 @@ async def _submit():
     await st.page.keyboard.press("Enter")
 
 ATTR_PATTERNS = ["Prepared using", "Generated by", "Powered by", "Answer by", "Using model", "with ", "via "]
+
+# ---------------------------------------------------------------------------
+# Source / citation extraction helpers
+# ---------------------------------------------------------------------------
+
+# These are bare source-name tokens Perplexity injects as inline text nodes
+# (e.g. the orange pill badges: "youtube", "openai", "reddit", etc.)
+# We strip lines that consist ONLY of one of these tokens (case-insensitive).
+_SOURCE_TOKEN_RE = re.compile(
+    r'^('  # anchor to full line
+    r'youtube|openai|reddit|twitter|x\.com|wikipedia|github|arxiv|medium|'
+    r'stackoverflow|stackexchange|hackernews|techcrunch|theverge|wired|'
+    r'forbes|bloomberg|reuters|bbc|cnn|nytimes|wsj|ft|guardian|'
+    r'perplexity|bing|google|msn|yahoo|quora|linkedin|facebook|instagram|'
+    r'tiktok|discord|substack|patreon|twitch|spotify|apple|microsoft|'
+    r'amazon|netflix|hulu|coursera|udemy|khan|mozilla|mdn|w3schools'
+    r')$',
+    re.IGNORECASE,
+)
+
+async def _extract_sources() -> list[dict]:
+    """
+    Scrape citation links from the Perplexity answer DOM.
+    Returns a list of {index, title, url} dicts.
+    """
+    try:
+        sources = await st.page.evaluate("""
+        () => {
+            const results = [];
+            const seen = new Set();
+
+            // Strategy 1: numbered citation superscripts with links
+            document.querySelectorAll('a[href]').forEach(a => {
+                const href = a.href;
+                if (!href || href.startsWith('javascript') || seen.has(href)) return;
+                // Only external links (not perplexity.ai itself for nav)
+                if (href.includes('perplexity.ai') && !href.includes('/search')) return;
+                const txt = (a.innerText || a.textContent || '').trim();
+                const parent = a.closest('[data-testid], [class*="citation"], [class*="source"], [class*="reference"]');
+                if (parent || /^\d+$/.test(txt) || a.closest('sup, [class*="cite"], [class*="Source"]')) {
+                    seen.add(href);
+                    results.push({
+                        index: results.length + 1,
+                        title: document.title || txt || href,
+                        url: href,
+                    });
+                }
+            });
+
+            // Strategy 2: source pill/badge links (the orange/grey domain badges)
+            if (results.length === 0) {
+                document.querySelectorAll('a[href]').forEach(a => {
+                    const href = a.href;
+                    if (!href || seen.has(href)) return;
+                    if (href.startsWith('http') && !href.includes('perplexity.ai')) {
+                        const txt = (a.innerText || '').trim();
+                        if (txt && txt.length < 60) {
+                            seen.add(href);
+                            results.push({
+                                index: results.length + 1,
+                                title: txt,
+                                url: href,
+                            });
+                        }
+                    }
+                });
+            }
+
+            return results.slice(0, 20); // cap at 20 sources
+        }
+        """)
+        return sources or []
+    except Exception as e:
+        log.debug(f"[SOURCES] extraction error: {e}")
+        return []
+
+def _clean_answer_text(text: str) -> str:
+    """
+    Remove bare source-name token lines (e.g. standalone 'youtube', 'openai')
+    that Perplexity injects as inline text nodes between paragraphs.
+    """
+    lines = text.splitlines()
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        # Drop lines that are ONLY a source token (with optional punctuation)
+        if stripped and _SOURCE_TOKEN_RE.match(stripped.rstrip('.,;:')):
+            continue
+        cleaned.append(line)
+    # Collapse 3+ consecutive blank lines into 2
+    result = re.sub(r'\n{3,}', '\n\n', '\n'.join(cleaned))
+    return result.strip()
+
+def _format_sources(sources: list[dict]) -> str:
+    """Format sources as a clean reference block."""
+    if not sources:
+        return ""
+    lines = ["\n\n---\n**Sources:**"]
+    for s in sources:
+        title = s.get("title") or s.get("url", "")
+        url = s.get("url", "")
+        idx = s.get("index", "")
+        if url:
+            lines.append(f"{idx}. [{title}]({url})")
+        else:
+            lines.append(f"{idx}. {title}")
+    return '\n'.join(lines)
+
+# ---------------------------------------------------------------------------
 
 async def _extract() -> tuple[str, str]:
     best = ""
@@ -409,6 +483,13 @@ async def _extract() -> tuple[str, str]:
             if m.lower() in attr.lower():
                 st.detected_model = m
                 break
+
+    # Clean the answer text and append formatted sources
+    sources = await _extract_sources()
+    best = _clean_answer_text(best)
+    if sources:
+        best = best + _format_sources(sources)
+
     return best, attr
 
 async def _wait_resp(timeout: int = 90) -> tuple[str, str]:
@@ -433,67 +514,139 @@ async def _wait_resp(timeout: int = 90) -> tuple[str, str]:
             prev = text
     return await _extract()
 
+# ---------------------------------------------------------------------------
+# Model switching — robust JS-driven approach
+# ---------------------------------------------------------------------------
+
 async def _switch_model(model: str) -> dict:
     r: dict = {"success": False, "model": model, "note": ""}
+
+    # Ensure we're on Perplexity home (model picker only exists there)
     if "perplexity.ai" not in st.page.url:
         await st.page.goto("https://www.perplexity.ai", wait_until="load")
         await asyncio.sleep(2)
-    btn = None
-    for sel in [
-        'button[data-testid*="model" i]', '[aria-label*="model" i]',
-        'button:has-text("Default")', 'button:has-text("Claude")',
-        'button:has-text("GPT")', 'button:has-text("Gemini")',
-        'button:has-text("Sonar")', 'button:has-text("R1")',
-        'div[class*="toolbar"] button', '.grow button',
-        'form button:not([aria-label*="submit" i])',
-    ]:
+
+    target = MODEL_LABEL.get(model)  # lowercase search token
+
+    # For Default, just navigate to home — the default model is always active there
+    if not target:
+        if "perplexity.ai" not in st.page.url or "/search/" in st.page.url:
+            await st.page.goto("https://www.perplexity.ai", wait_until="load")
+            await asyncio.sleep(2)
+        st.current_model = "Default"
+        r.update({"success": True, "note": "Navigated to home — Default model active"})
+        await broadcast("model_switched", r)
+        return r
+
+    # --- Step 1: Find and click the model picker button via JS ---
+    # We scan ALL buttons on the page and find one whose text matches a known
+    # model name keyword (Claude / GPT / Gemini / Sonar / R1 / Default)
+    # This avoids brittle selector chains.
+    model_btn_keywords = ["claude", "gpt", "gemini", "sonar", "r1", "default", "model", "pro search"]
+    skip_keywords = ["send", "submit", "attach", "upload", "search the web",
+                     "sign", "log in", "new chat", "share", "copy", "stop"]
+
+    found_btn = await st.page.evaluate("""
+    (args) => {
+        const { modelBtnKeywords, skipKeywords } = args;
+        const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+        for (const btn of buttons) {
+            const txt = (btn.innerText || btn.textContent || '').toLowerCase().trim();
+            const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+            const combined = txt + ' ' + label;
+            if (skipKeywords.some(k => combined.includes(k))) continue;
+            if (modelBtnKeywords.some(k => combined.includes(k))) {
+                // Mark it for Playwright to find
+                btn.setAttribute('data-mcp-model-btn', 'true');
+                return true;
+            }
+        }
+        return false;
+    }
+    """, {"modelBtnKeywords": model_btn_keywords, "skipKeywords": skip_keywords})
+
+    if found_btn:
         try:
-            loc = st.page.locator(sel).first
-            if await loc.count() > 0 and await loc.is_visible():
-                lbl = (await loc.get_attribute("aria-label") or "").lower()
-                txt = (await loc.inner_text() or "").lower()
-                if any(x in lbl or x in txt for x in ["send", "submit", "attach", "upload", "search"]):
-                    continue
-                btn = loc
-                break
-        except:
-            continue
-    if not btn:
+            btn_loc = st.page.locator('[data-mcp-model-btn="true"]').first
+            await btn_loc.scroll_into_view_if_needed()
+            await btn_loc.click()
+            await asyncio.sleep(1.5)
+            # Clean up our marker attribute
+            await st.page.evaluate("document.querySelectorAll('[data-mcp-model-btn]').forEach(el => el.removeAttribute('data-mcp-model-btn'))")
+        except Exception as e:
+            log.warning(f"[MODEL] Failed clicking model btn: {e}")
+            found_btn = False
+
+    if not found_btn:
+        # Fallback: screenshot for debug
         fn = str(DOWNLOADS / "debug_model_btn.png")
         await st.page.screenshot(path=fn)
-        r["note"] = "Model button not found — screenshot saved as debug_model_btn.png"
+        r["note"] = "Model picker button not found — saved debug_model_btn.png"
         return r
-    await btn.click()
-    await asyncio.sleep(1.5)
-    pt = MODEL_LABEL.get(model)
-    if not pt:
-        await st.page.keyboard.press("Escape")
-        st.current_model = "Default"
-        r.update({"success": True, "note": "Default active"})
-        return r
+
+    # --- Step 2: Click the correct option in the opened dropdown ---
+    # Try multiple selector patterns for the option
+    option_selectors = [
+        f'[role="option"]:has-text("{target}")',
+        f'[role="menuitem"]:has-text("{target}")',
+        f'[role="radio"]:has-text("{target}")',
+        f'li:has-text("{target}")',
+        f'button:has-text("{target}")',
+        f'label:has-text("{target}")',
+        f'div[class*="option" i]:has-text("{target}")',
+        f'div[class*="item" i]:has-text("{target}")',
+    ]
+
     clicked = False
-    for sel in [
-        f'[role="option"]:has-text("{pt}")', f'li:has-text("{pt}")',
-        f'button:has-text("{pt}")', f'div[role="menuitem"]:has-text("{pt}")',
-        f'[role="radio"]:has-text("{pt}")', f'label:has-text("{pt}")',
-    ]:
+    for sel in option_selectors:
         try:
             opt = st.page.locator(sel).first
-            if await opt.count() > 0 and await opt.is_visible():
+            if await opt.count() > 0 and await opt.is_visible(timeout=2000):
                 await opt.click()
                 await asyncio.sleep(1)
                 st.current_model = model
-                r.update({"success": True, "note": f"Selected {pt}"})
+                r.update({"success": True, "note": f"✓ Switched to {model}"})
+                log.info(f"[MODEL] ✓ Switched to {model} via selector: {sel}")
                 clicked = True
                 break
-        except:
+        except Exception:
             continue
+
+    # Fallback: JS-scan the open dropdown for matching text
+    if not clicked:
+        js_clicked = await st.page.evaluate("""
+        (targetText) => {
+            const candidates = Array.from(
+                document.querySelectorAll('[role="option"], [role="menuitem"], [role="radio"], li, label')
+            );
+            for (const el of candidates) {
+                const txt = (el.innerText || el.textContent || '').toLowerCase();
+                if (txt.includes(targetText)) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }
+        """, target)
+
+        if js_clicked:
+            await asyncio.sleep(1)
+            st.current_model = model
+            r.update({"success": True, "note": f"✓ Switched to {model} via JS click"})
+            log.info(f"[MODEL] ✓ Switched to {model} via JS fallback")
+            clicked = True
+
     if not clicked:
         fn = str(DOWNLOADS / "debug_model_picker.png")
         await st.page.screenshot(path=fn)
         await st.page.keyboard.press("Escape")
-        r["note"] = f"Picker opened but option '{pt}' not found — check debug_model_picker.png"
+        r["note"] = f"Picker opened but option '{target}' not found — check debug_model_picker.png"
+        log.warning(f"[MODEL] ✗ Could not find option for {model}")
+
     return r
+
+# ---------------------------------------------------------------------------
 
 async def tool_send_message(p: dict) -> dict:
     await _ensure()
@@ -513,7 +666,7 @@ async def tool_send_message(p: dict) -> dict:
         mdl = st.detected_model or st.current_model
         fname = f"response_{int(time.time())}.txt"
         async with aiofiles.open(DOWNLOADS / fname, "w") as f:
-            await f.write(f"Model: {mdl}\nAttribution: {attr}\n{'─'*60}\n{resp}")
+            await f.write(f"Model: {mdl}\nAttribution: {attr}\n{'\u2500'*60}\n{resp}")
         await broadcast("response_ready", {
             "preview": resp[:300],
             "full": resp,
@@ -650,14 +803,14 @@ async def lifespan(app: FastAPI):
         try: await st.pw.stop()
         except: pass
 
-app = FastAPI(title="Hermes-Perplexity MCP", version="9.5.1", lifespan=lifespan)
+app = FastAPI(title="Hermes-Perplexity MCP", version="9.6.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/sse")
 async def sse_ep(request: Request):
     q: asyncio.Queue = asyncio.Queue()
     clients.append(q)
-    await q.put(json.dumps({"type": "mcp_init", "version": "9.5.1", "tools": MCP_TOOL_DEFS, "models": MODELS}))
+    await q.put(json.dumps({"type": "mcp_init", "version": "9.6.0", "tools": MCP_TOOL_DEFS, "models": MODELS}))
     async def gen():
         try:
             while True:
@@ -682,7 +835,7 @@ async def mcp_ep(req: MCPReq):
         return {"jsonrpc": "2.0", "id": req.id, "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "hermes-perplexity", "version": "9.5.1"}}}
+            "serverInfo": {"name": "hermes-perplexity", "version": "9.6.0"}}}
     if req.method == "tools/list":
         return {"jsonrpc": "2.0", "id": req.id, "result": {"tools": MCP_TOOL_DEFS}}
     if req.method == "tools/call":
@@ -726,7 +879,7 @@ async def status_ep():
         "detected_model": st.detected_model, "sse_clients": len(clients),
         "chrome_exe": CHROME_EXE or "playwright bundled chromium",
         "debug_profile": str(DEBUG_PROFILE), "automation_profile": str(AUTO_PROFILE),
-        "last_response_length": len(st.last_resp), "version": "9.5.1",
+        "last_response_length": len(st.last_resp), "version": "9.6.0",
     }
 
 @app.get("/screenshot/latest")
