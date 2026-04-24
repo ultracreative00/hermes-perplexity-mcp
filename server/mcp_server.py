@@ -19,10 +19,14 @@ BASE_DIR     = Path(__file__).parent.parent
 UPLOADS      = BASE_DIR / "uploads"
 DOWNLOADS    = BASE_DIR / "downloads"
 AUTO_PROFILE = BASE_DIR / "chrome-profile"
+# Real Chrome debug profile — matches: google-chrome-stable --remote-debugging-port=9222 --user-data-dir="$HOME/chrome-debug-profile"
+DEBUG_PROFILE = Path.home() / "chrome-debug-profile"
+CDP_URL       = "http://localhost:9222"
 
 UPLOADS.mkdir(exist_ok=True)
 DOWNLOADS.mkdir(exist_ok=True)
 AUTO_PROFILE.mkdir(exist_ok=True)
+DEBUG_PROFILE.mkdir(exist_ok=True)
 
 def find_chrome_exe() -> str:
     for c in [
@@ -63,6 +67,7 @@ class State:
     last_resp = ""
     ready = False
     logged_in = False
+    cdp_mode = False   # True when connected via CDP to real Chrome
 
 st = State()
 clients: list[asyncio.Queue] = []
@@ -72,68 +77,161 @@ async def broadcast(t: str, d: dict):
     for q in clients:
         await q.put(msg)
 
-async def launch_browser():
+# ---------------------------------------------------------------------------
+# CDP connect helper — attaches to an already-running Chrome on port 9222
+# ---------------------------------------------------------------------------
+async def _try_cdp_connect() -> bool:
+    """
+    Try to connect to a Chrome instance launched with:
+      google-chrome-stable --remote-debugging-port=9222 --user-data-dir="$HOME/chrome-debug-profile"
+
+    Returns True on success, False if no browser is listening on CDP_URL.
+    """
     try:
-        profile = str(AUTO_PROFILE)
-        log.info("=" * 55)
-        log.info(f"[LAUNCH] Profile  = {profile}")
-        log.info(f"[LAUNCH] Chrome   = {CHROME_EXE or 'playwright bundled chromium'}")
-        log.info(f"[LAUNCH] UID      = {os.getuid()}")
-        log.info("=" * 55)
-
-        for lock in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
-            lp = AUTO_PROFILE / lock
-            if lp.exists():
-                lp.unlink()
-                log.info(f"[LAUNCH] Removed stale lock: {lp.name}")
-
         st.pw = await async_playwright().start()
-        args = [
-            "--password-store=basic",
-            "--use-mock-keychain",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-default-apps",
-            "--disable-infobars",
-            "--window-size=1280,900",
-        ]
-        if os.getuid() == 0:
-            args.append("--no-sandbox")
+        browser = await st.pw.chromium.connect_over_cdp(CDP_URL, timeout=5_000)
+        log.info(f"[LAUNCH] ✓ Connected to real Chrome via CDP at {CDP_URL}")
+        st.cdp_mode = True
 
-        kw: dict = dict(
-            user_data_dir       = profile,
-            headless            = False,
-            viewport            = {"width": 1280, "height": 900},
-            args                = args,
-            ignore_default_args = ["--enable-automation"],
-            timeout             = 60_000,
-        )
-        if CHROME_EXE:
-            kw["executable_path"] = CHROME_EXE
+        # Use the first existing context/page, or create one
+        contexts = browser.contexts
+        if contexts:
+            st.ctx = contexts[0]
+        else:
+            st.ctx = await browser.new_context()
 
-        st.ctx = await st.pw.chromium.launch_persistent_context(**kw)
-        await asyncio.sleep(1)
         pages = st.ctx.pages
         st.page = pages[0] if pages else await st.ctx.new_page()
 
-        nav_ok = False
-        for attempt in range(1, 4):
-            try:
-                await st.page.goto("https://www.perplexity.ai", wait_until="load", timeout=30_000)
-                nav_ok = True
-                break
-            except Exception as e:
-                log.warning(f"[LAUNCH] Nav attempt {attempt}/3 failed: {e}")
-                await asyncio.sleep(2)
+        # Navigate to Perplexity if not already there
+        if "perplexity.ai" not in st.page.url:
+            for attempt in range(1, 4):
+                try:
+                    await st.page.goto("https://www.perplexity.ai", wait_until="load", timeout=30_000)
+                    break
+                except Exception as e:
+                    log.warning(f"[LAUNCH] Nav attempt {attempt}/3 failed: {e}")
+                    await asyncio.sleep(2)
 
         await asyncio.sleep(3)
+        return True
+    except Exception as e:
+        log.info(f"[LAUNCH] CDP connect failed ({e}) — falling back to Playwright launch")
+        # Clean up so we can re-init in the fallback path
+        try:
+            if st.pw:
+                await st.pw.stop()
+        except:
+            pass
+        st.pw = None
+        st.ctx = None
+        st.page = None
+        st.cdp_mode = False
+        return False
+
+# ---------------------------------------------------------------------------
+# Fallback: Playwright persistent-context launch (automation profile)
+# ---------------------------------------------------------------------------
+async def _launch_playwright_context():
+    profile = str(AUTO_PROFILE)
+    log.info("=" * 55)
+    log.info(f"[LAUNCH] Mode     = Playwright persistent context (fallback)")
+    log.info(f"[LAUNCH] Profile  = {profile}")
+    log.info(f"[LAUNCH] Chrome   = {CHROME_EXE or 'playwright bundled chromium'}")
+    log.info(f"[LAUNCH] UID      = {os.getuid()}")
+    log.info("=" * 55)
+
+    for lock in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
+        lp = AUTO_PROFILE / lock
+        if lp.exists():
+            lp.unlink()
+            log.info(f"[LAUNCH] Removed stale lock: {lp.name}")
+
+    st.pw = await async_playwright().start()
+    args = [
+        "--password-store=basic",
+        "--use-mock-keychain",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-default-apps",
+        "--disable-infobars",
+        "--window-size=1280,900",
+    ]
+    if os.getuid() == 0:
+        args.append("--no-sandbox")
+
+    kw: dict = dict(
+        user_data_dir       = profile,
+        headless            = False,
+        viewport            = {"width": 1280, "height": 900},
+        args                = args,
+        ignore_default_args = ["--enable-automation"],
+        timeout             = 60_000,
+    )
+    if CHROME_EXE:
+        kw["executable_path"] = CHROME_EXE
+
+    st.ctx = await st.pw.chromium.launch_persistent_context(**kw)
+    await asyncio.sleep(1)
+    pages = st.ctx.pages
+    st.page = pages[0] if pages else await st.ctx.new_page()
+
+    for attempt in range(1, 4):
+        try:
+            await st.page.goto("https://www.perplexity.ai", wait_until="load", timeout=30_000)
+            break
+        except Exception as e:
+            log.warning(f"[LAUNCH] Nav attempt {attempt}/3 failed: {e}")
+            await asyncio.sleep(2)
+
+    await asyncio.sleep(3)
+
+# ---------------------------------------------------------------------------
+# Main launch entry point
+# ---------------------------------------------------------------------------
+async def launch_browser():
+    try:
+        # 1. Try CDP first (real Chrome, no bot-detection)
+        cdp_ok = await _try_cdp_connect()
+
+        if not cdp_ok:
+            # 2. Fall back to Playwright launch
+            await _launch_playwright_context()
+
         st.logged_in = await _check_login()
         st.ready = True
-        log.info(f"[LAUNCH] READY — logged_in={st.logged_in}")
 
-        note = ("✓ Already logged in" if st.logged_in
-                else "⚠ First run: please sign into Perplexity in the browser — session will be saved to ./chrome-profile/")
-        await broadcast("browser_ready", {"logged_in": st.logged_in, "url": st.page.url, "profile": profile, "note": note})
+        mode = "CDP (real Chrome)" if st.cdp_mode else "Playwright (automation)"
+        log.info(f"[LAUNCH] READY — mode={mode} logged_in={st.logged_in}")
+
+        if st.cdp_mode:
+            note = (
+                "✓ Connected to your real Chrome via CDP. Already logged in!"
+                if st.logged_in
+                else (
+                    "⚠ Connected to real Chrome via CDP but not logged in. "
+                    "Please sign into Perplexity in the browser window — session will be saved automatically."
+                )
+            )
+        else:
+            note = (
+                "✓ Already logged in (Playwright mode)"
+                if st.logged_in
+                else (
+                    "⚠ First run: please sign into Perplexity in the browser — "
+                    "session will be saved to ./chrome-profile/\n\n"
+                    "TIP: For a better experience without bot-detection, launch Chrome first:\n"
+                    f'  google-chrome-stable --remote-debugging-port=9222 --user-data-dir="{DEBUG_PROFILE}"\n'
+                    "Then restart the MCP server."
+                )
+            )
+
+        await broadcast("browser_ready", {
+            "logged_in": st.logged_in,
+            "url": st.page.url,
+            "mode": mode,
+            "note": note,
+        })
 
     except Exception as e:
         log.error(f"[LAUNCH] FATAL: {e}")
@@ -265,7 +363,7 @@ async def _switch_model(model: str) -> dict:
         r.update({"success": True, "note": "Default active"})
         return r
     for sel in [f'[role="option"]:has-text("{pt}")', f'li:has-text("{pt}")',
-                f'button:has-text("{pt}")', f'div[role="menuitem"]:has-text("{pt}")']: 
+                f'button:has-text("{pt}")', f'div[role="menuitem"]:has-text("{pt}")']:
         try:
             opt = st.page.locator(sel).first
             if await opt.count() > 0 and await opt.is_visible():
@@ -359,7 +457,19 @@ async def tool_list_models(p: dict) -> dict:
 async def tool_check_login(p: dict) -> dict:
     await _ensure()
     li = await _check_login()
-    return {"logged_in": li, "profile": str(AUTO_PROFILE), "chrome": CHROME_EXE or "playwright bundled chromium"}
+    mode = "CDP (real Chrome)" if st.cdp_mode else "Playwright (automation)"
+    return {
+        "logged_in": li,
+        "mode": mode,
+        "cdp_url": CDP_URL,
+        "debug_profile": str(DEBUG_PROFILE),
+        "automation_profile": str(AUTO_PROFILE),
+        "chrome": CHROME_EXE or "playwright bundled chromium",
+        "tip": (
+            None if st.cdp_mode else
+            f'Launch real Chrome first: google-chrome-stable --remote-debugging-port=9222 --user-data-dir="{DEBUG_PROFILE}" && restart server'
+        ),
+    }
 
 TOOLS = {
     "send_message":      tool_send_message,
@@ -387,7 +497,7 @@ MCP_TOOL_DEFS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "list_models", "description": "List all available Perplexity models and the currently active one",
      "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "check_login", "description": "Check whether Perplexity is currently logged in",
+    {"name": "check_login", "description": "Check whether Perplexity is currently logged in and show connection mode",
      "inputSchema": {"type": "object", "properties": {}}},
 ]
 
@@ -400,21 +510,22 @@ async def lifespan(app: FastAPI):
     task.add_done_callback(_done)
     yield
     if not task.done(): task.cancel()
-    if st.ctx:
+    if st.ctx and not st.cdp_mode:
+        # Only close context if we own it (Playwright mode). In CDP mode the user owns Chrome.
         try: await st.ctx.close()
         except: pass
     if st.pw:
         try: await st.pw.stop()
         except: pass
 
-app = FastAPI(title="Hermes-Perplexity MCP", version="9.0.0", lifespan=lifespan)
+app = FastAPI(title="Hermes-Perplexity MCP", version="9.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/sse")
 async def sse_ep(request: Request):
     q: asyncio.Queue = asyncio.Queue()
     clients.append(q)
-    await q.put(json.dumps({"type": "mcp_init", "version": "9.0.0", "tools": MCP_TOOL_DEFS, "models": MODELS}))
+    await q.put(json.dumps({"type": "mcp_init", "version": "9.1.0", "tools": MCP_TOOL_DEFS, "models": MODELS}))
     async def gen():
         try:
             while True:
@@ -439,7 +550,7 @@ async def mcp_ep(req: MCPReq):
         return {"jsonrpc": "2.0", "id": req.id, "result": {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "hermes-perplexity", "version": "9.0.0"}}}
+            "serverInfo": {"name": "hermes-perplexity", "version": "9.1.0"}}}
     if req.method == "tools/list":
         return {"jsonrpc": "2.0", "id": req.id, "result": {"tools": MCP_TOOL_DEFS}}
     if req.method == "tools/call":
@@ -476,10 +587,20 @@ async def dls_ep():
 
 @app.get("/status")
 async def status_ep():
-    return {"browser_ready": st.ready, "logged_in": st.logged_in, "current_model": st.current_model,
-            "detected_model": st.detected_model, "sse_clients": len(clients),
-            "chrome_exe": CHROME_EXE or "playwright bundled chromium",
-            "automation_profile": str(AUTO_PROFILE), "last_response_length": len(st.last_resp), "version": "9.0.0"}
+    return {
+        "browser_ready": st.ready,
+        "logged_in": st.logged_in,
+        "mode": "CDP (real Chrome)" if st.cdp_mode else "Playwright (automation)",
+        "cdp_url": CDP_URL,
+        "current_model": st.current_model,
+        "detected_model": st.detected_model,
+        "sse_clients": len(clients),
+        "chrome_exe": CHROME_EXE or "playwright bundled chromium",
+        "debug_profile": str(DEBUG_PROFILE),
+        "automation_profile": str(AUTO_PROFILE),
+        "last_response_length": len(st.last_resp),
+        "version": "9.1.0",
+    }
 
 @app.get("/screenshot/latest")
 async def latest_shot():
