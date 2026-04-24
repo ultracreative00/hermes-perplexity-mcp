@@ -1,6 +1,4 @@
-# Hello World
-
-# Hermes ↔ Perplexity MCP Bridge v9
+# Hermes ↔ Perplexity MCP Bridge v9.1
 
 > **Control Perplexity AI via your real browser — no API key required. No Perplexity API is used or permitted.**
 
@@ -11,11 +9,38 @@
 ```bash
 git clone https://github.com/ultracreative00/hermes-perplexity-mcp
 cd hermes-perplexity-mcp
-./setup.sh       # first time only
-./start.sh
+bash install.sh
 ```
 
+`bash install.sh` handles everything — dependencies, permissions, virtual environment setup, and first-run checks. No need to run `setup.sh` or `start.sh` manually on first install.
+
 Then open: **http://localhost:3456/dashboard/**
+
+---
+
+## Recommended: Launch Real Chrome First (Avoids Bot Detection)
+
+Perplexity detects automated browsers and may block the login screen. To avoid this, launch your **real Chrome** with remote debugging enabled **before** starting the MCP server:
+
+```bash
+google-chrome-stable \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/chrome-debug-profile"
+```
+
+Sign into Perplexity in that window (first time only — session is saved to `~/chrome-debug-profile`).
+
+Then start the server in a second terminal:
+
+```bash
+bash install.sh
+```
+
+The server will log `✓ Connected to real Chrome via CDP` and operate fully logged in.
+
+> **If you skip this step**, the server falls back to a Playwright-managed browser. It still works, but you may need to sign in manually on the first run.
+
+---
 
 ## Architecture
 
@@ -27,22 +52,33 @@ Hermes Agent
     ▼
 MCP Server (FastAPI + Playwright)
     │
-    │  Browser automation (launch_persistent_context)
-    │  Dedicated profile: ./chrome-profile/
+    ├─ CDP mode (preferred): attaches to real Chrome on port 9222
+    │    google-chrome-stable --remote-debugging-port=9222
+    │    --user-data-dir="$HOME/chrome-debug-profile"
+    │
+    └─ Fallback mode: Playwright persistent context
+         Dedicated profile: ./chrome-profile/
+    │
     ▼
 Perplexity Browser (https://www.perplexity.ai)
 ```
 
-## Why v9 Works on Chrome 136+
+## How the CDP / Fallback Logic Works
 
-Chrome 136 silently disabled `--remote-debugging-port` when pointed at the
-default profile (`~/.config/google-chrome`).
+On every startup the server tries two strategies in order:
 
-**v9 uses a dedicated automation profile at `./chrome-profile/`** via
-`launch_persistent_context()` — the only reliable approach on Chrome 136+ Linux.
+| # | Mode | How | Login |
+|---|------|-----|-------|
+| 1 | **CDP (real Chrome)** | Connects to Chrome already running on `localhost:9222` | Uses your existing browser session — no re-login needed |
+| 2 | **Playwright fallback** | Launches its own Chromium with `./chrome-profile/` | Sign in once; session is saved for future runs |
 
-- **First run:** Chrome opens fresh — sign into Perplexity once
-- **All future runs:** Session saved in `./chrome-profile/` — no sign-in needed
+Check which mode is active at any time:
+
+```
+GET http://localhost:3456/status   →  "mode": "CDP (real Chrome)" or "Playwright (automation)"
+```
+
+---
 
 ## Endpoints
 
@@ -67,7 +103,7 @@ default profile (`~/.config/google-chrome`).
 | `screenshot` | Screenshot the browser |
 | `new_chat` | Start a fresh conversation |
 | `list_models` | List available models |
-| `check_login` | Verify login status |
+| `check_login` | Verify login status and show connection mode |
 
 ## Hermes Agent Config
 
@@ -110,19 +146,29 @@ python client/hermes_mcp_client.py --new-chat
 ```
 hermes-perplexity-mcp/
 ├── server/
-│   └── mcp_server.py        # FastAPI + Playwright MCP server
+│   └── mcp_server.py        # FastAPI + Playwright MCP server (v9.1)
 ├── client/
 │   └── hermes_mcp_client.py # CLI client for Hermes
 ├── dashboard/
 │   └── index.html           # Web UI
-├── chrome-profile/          # Dedicated Chrome automation profile
+├── chrome-profile/          # Playwright fallback Chrome profile
 ├── uploads/                 # Files uploaded to Perplexity
 ├── downloads/               # Responses saved from Perplexity
 ├── requirements.txt
+├── install.sh               # One-command install & start
 ├── setup.sh
 ├── start.sh
 └── hermes_mcp_config.json
 ```
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Perplexity opens but no login option visible | Launch real Chrome with `--remote-debugging-port=9222` first (see above) |
+| `CDP connect failed` in logs | Chrome isn't running on port 9222 — server falls back to Playwright automatically |
+| `Permission denied` on `install.sh` | Run `bash install.sh` (not `./install.sh`) — no chmod needed |
+| Already logged in but server says not logged in | Run `check_login` tool or check `/status` to confirm CDP mode is active |
 
 ## License
 
